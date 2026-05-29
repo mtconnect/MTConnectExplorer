@@ -1,0 +1,35 @@
+{
+    "configurations": [
+        {
+            "name": "Streamlit",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.main",
+            "cwd": "${workspaceFolder}/",
+        },
+        {
+            "name": "Loopback Test",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.main",
+            "args": ["--loopback-test"],
+            "cwd": "${workspaceFolder}/",
+        },
+        {
+            "name": "Mirror Test",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.main",
+            "args": ["--mirror-test"],
+            "cwd": "${workspaceFolder}/",
+        },
+        {
+            "name": "Play Test",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.main",
+            "args": ["--play-test"],
+            "cwd": "${workspaceFolder}/",
+        }
+    ]
+}

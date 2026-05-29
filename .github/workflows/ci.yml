@@ -1,0 +1,47 @@
+name: CI
+
+# Pre-merge build check. Runs on PRs into the protected staging/release branches
+# so a PR can't merge unless the app still builds on both shipped platforms.
+# Mark `build-linux` and `build-windows` as required status checks on these
+# branches (see contributing.md → Branch protection rules).
+on:
+  pull_request:
+    branches: [main, 'dev-*', 'release-*']
+
+# A new push to the same PR cancels the in-flight run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build with make
+        run: make
+      - name: Verify binary was produced
+        run: test -f dist/MTConnectExplorer
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build with build.bat
+        shell: cmd
+        run: build.bat ci
+      - name: Verify binary was produced
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist\MTConnectExplorer.exe)) {
+            throw "dist\MTConnectExplorer.exe not found"
+          }

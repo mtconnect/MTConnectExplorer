@@ -1,0 +1,6 @@
+pyinstaller
+
+pydantic
+psutil
+streamlit
+streamlit-tree-select
