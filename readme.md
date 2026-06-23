@@ -1,12 +1,18 @@
 # MTConnectExplorer
 
+
 > [!CAUTION]
 > This application is an early stage prototype. Use with caution.
+
+
+> [!WARNING]
+> While `DATA_SET` and `TABLE` DataItems can be captured, replay of `DATA_SET` and `TABLE` DataItems have not yet been implemented.
+
 
 MTConnectExplorer is a utility for:
 
 1. Viewing the data provided by an [MTConnect Agent](https://github.com/mtconnect/cppagent).
-1. Capturing and replaying streaming data using the [Testbed as a Service (TaaS)](https://github.com/m-r-mccormick/Testbed-as-a-Service) method (tailored for MTConnect), empowering the remote development of digital shadows.
+1. Capturing and replaying streaming data using the [Testbed as a Service (TaaS)](https://github.com/m-r-mccormick/Testbed-as-a-Service) method (tailored for MTConnect), empowering the remote development of downstream application such as digital shadows.
 1. The collaborative identification and remedy of interoperability issues.
 
 This utility uses the [Testbed as a Service (TaaS)](https://github.com/m-r-mccormick/Testbed-as-a-Service) method for capturing and replaying streaming datasets.
@@ -48,10 +54,18 @@ If you are using this utility in support of an academic publication, please cons
 
 ## Explore
 
-Todo. Pre-alpha.
+The `Explore` page allows you to view the data available from a MTConnect agent.
+
+![Explore Page](.github/Explore1.png)
+
+![Explore Page](.github/Explore2.png)
 
 
 ## Capture
+
+The `Capture` page allows you to capture data from an MTConnect agent (e.g., [https://demo.mtconnect.org/](https://demo.mtconnect.org/)) and save it to a `.jsonl` dataset file.
+
+![Capture Page](.github/Capture1.png)
 
 ```mermaid
 flowchart LR
@@ -63,7 +77,6 @@ flowchart LR
     Agent --Stream/Sample/Current--> MTCE
 ```
 
-The `Capture` page allows you to capture data from an MTConnect agent (e.g., [https://demo.mtconnect.org/](https://demo.mtconnect.org/)) and save it to a `.jsonl` dataset file.
 
 ### Dataset Format
 
@@ -203,7 +216,19 @@ The recommended modes in order of priority are:
 1. `current` mode (Not Recommended)
 
 
+## Datasets
+
+The `Datasets` page allows you to view, upload, download, rename, and delete datasets.
+
+![Datasets Page](.github/Datasets1.png)
+
 ## Play
+
+The `Play` page allows you to play a `.jsonl` dataset.
+When playing a dataset, an instance of the [MTConnect Agent](https://github.com/mtconnect/cppagent), and a SHDR adapter
+    are automatically created and started.
+
+![Play Page Screenshot](.github/Play1.png)
 
 ```mermaid
 flowchart LR
@@ -221,7 +246,3 @@ flowchart LR
     Agent --Stream/Sample/Current--> Dashboard["Dashboard"]
     Agent --Stream/Sample/Current--> DS["Digital Shadow"]
 ```
-
-The `Play` page allows you to play a `.jsonl` dataset.
-When playing a dataset, an instance of the [MTConnect Agent](https://github.com/mtconnect/cppagent), and a SHDR adapter
-    are automatically created and started.

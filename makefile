@@ -43,21 +43,3 @@ src/bin/agent:
 	cp build/usr/bin/agent src/bin/
 #	Remove temporary build directory
 	rm -rf build/
-
-#src/bin/agent.exe:
-##	Create temporary build directory
-#	mkdir -p build
-##	Download the *win64.zip package
-#	cd build && \
-#		curl -s https://api.github.com/repos/mtconnect/cppagent/releases/latest \
-#		| grep "browser_download_url.*\win64.zip" \
-#		| cut -d '"' -f 4 \
-#		| xargs curl -LO
-##	Extract zip contents
-#	cd build && unzip -q *.zip
-##	Create bin directory
-#	mkdir -p src/bin
-##	Copy agent to bin
-#	cp build/agent-*-win64/bin/agent.exe src/bin
-##	Remove temporary build directory
-#	rm -rf build/

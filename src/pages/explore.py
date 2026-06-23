@@ -16,6 +16,14 @@ from src.client import (
     MtConnectExplorer,
     MtConnectObservation,
 )
+from src.pages.core import (
+    GlobalState,
+    agent_url,
+    get_explore_state,
+    get_global_state,
+    get_play_state,
+    get_state_lock,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -189,6 +197,27 @@ def _subtree_data_items(node: TreeNode) -> List[TreeNode]:
     return result
 
 
+def _filter_tree(node: TreeNode, query: str) -> Optional[TreeNode]:
+    """Return a pruned copy of node keeping only branches that match query on id
+    or name (case-insensitive). Ancestors of matches are retained so the path is
+    visible; if a node itself matches, its full subtree is kept. Returns None when
+    nothing in the subtree matches."""
+    self_match = query in node.label.lower() or query in node.id.lower()
+    filtered_children = [
+        fc for fc in (_filter_tree(c, query) for c in node.children) if fc is not None
+    ]
+    if not self_match and not filtered_children:
+        return None
+    return TreeNode(
+        id=node.id,
+        label=node.label,
+        tag=node.tag,
+        attributes=node.attributes,
+        children=node.children if self_match else filtered_children,
+        is_data_item=node.is_data_item,
+    )
+
+
 def _to_select_node(node: TreeNode) -> dict:
     entry: dict = {"label": node.label, "value": node.id}
     if node.children:
@@ -196,11 +225,21 @@ def _to_select_node(node: TreeNode) -> dict:
     return entry
 
 
-def _render_history(history: List[MtConnectObservation], window: timedelta) -> None:
+def _render_history(
+    history: List[MtConnectObservation],
+    window: timedelta,
+    x_max: Optional[datetime] = None,
+) -> None:
     """Render observation history as a line chart (numeric) or table (non-numeric).
-    X-axis spans [now - window, now] so gaps in data are visible."""
-    now_utc = datetime.now(tz=timezone.utc)
-    x_min_utc = now_utc - window
+    The X-axis spans [x_max - window, x_max]. When ``x_max`` is given (e.g. the
+    current time, shared across plots), the right edge tracks it even while a
+    DataItem receives no new data; otherwise it falls back to the most recent
+    observation's timestamp so replayed/historical data is still visible."""
+    x_max_utc = x_max if x_max is not None else max(
+        (h.timestamp for h in history),
+        default=datetime.now(tz=timezone.utc),
+    )
+    x_min_utc = x_max_utc - window
     try:
         pairs = [(h.timestamp, float(h.text)) for h in history if h.text and h.timestamp >= x_min_utc]
         if not pairs:
@@ -217,7 +256,7 @@ def _render_history(history: List[MtConnectObservation], window: timedelta) -> N
                 x=alt.X(
                     "timestamp:T",
                     axis=alt.Axis(format="%H:%M:%S", labelAngle=-30, title=None),
-                    scale=alt.Scale(domain=[x_min_utc.isoformat(), now_utc.isoformat()]),
+                    scale=alt.Scale(domain=[x_min_utc.isoformat(), x_max_utc.isoformat()]),
                 ),
                 y=alt.Y("value:Q", axis=alt.Axis(title=None)),
             )
@@ -242,98 +281,103 @@ def explore_page() -> None:
     st.set_page_config(page_title="MTConnectExplorer", layout="wide")
     st.title("Explore")
 
-    _DEFAULTS = {
-        "exp_running": False,
-        "exp_explorer": None,
-        "exp_selected_id": None,
-        "exp_expanded": None,
-        "exp_device_filter": None,
-        "exp_hist_window_val": 5,
-        "exp_hist_window_unit": "minutes",
-        "exp_pinned_items": [],
-        "exp_pin_window_val": 5,
-        "exp_pin_window_unit": "minutes",
-        "exp_last_error": None,
-        "exp_cfg_base_url": "https://demo.mtconnect.org/",
-        "exp_cfg_interval_ms": 1000,
-        "exp_cfg_mode": "stream",
-    }
-    for k, v in _DEFAULTS.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+    global_state = get_global_state()
+    state = get_explore_state()
 
-    disabled = st.session_state.exp_running
+    disabled = state.running
 
-    # --- Configuration ---
-    st.subheader("Configuration")
-    base_url = st.text_input(
-        "Base URL", value=st.session_state.exp_cfg_base_url,
-        key="exp_input_base_url", disabled=disabled,
-    )
-    col1, col2 = st.columns(2)
-    with col1:
-        interval_ms = st.number_input(
-            "Interval (ms)", value=st.session_state.exp_cfg_interval_ms,
-            min_value=1, step=1, key="exp_input_interval", disabled=disabled,
+    # --- Configuration (kept narrow; the rest of the page stays wide) ---
+    config_col = st.columns([1, 2, 1])[1]
+    with config_col:
+        st.subheader("Configuration")
+        # Editable dropdown: free-text URL. The default demo URL is always first and
+        # the default selection; only currently-playing agents follow as quick
+        # options (so stopped playbacks don't linger in the list).
+        play_state = get_play_state()
+        playing_urls = [agent_url(s.config.agent_port) for s in play_state.sessions.values()]
+        default_url = GlobalState.model_fields["base_url"].default
+        base_url_options: list = []
+        for u in [default_url, *playing_urls]:
+            if u and u not in base_url_options:
+                base_url_options.append(u)
+        base_url = st.selectbox(
+            "Base URL",
+            base_url_options,
+            index=0,
+            accept_new_options=True,
+            key="exp_base_url_select",
+            disabled=disabled,
         )
-    with col2:
-        _modes = ["stream", "sample", "current"]
-        mode = st.selectbox(
-            "Mode", _modes,
-            index=_modes.index(st.session_state.exp_cfg_mode),
-            key="exp_input_mode", disabled=disabled,
-            filter_mode=None,
-        )
+        col1, col2 = st.columns(2)
+        with col1:
+            interval_ms = st.number_input(
+                "Interval (ms)", value=state.cfg_interval_ms,
+                min_value=1, step=1, key="exp_input_interval", disabled=disabled,
+            )
+        with col2:
+            _modes = ["stream", "sample", "current"]
+            mode = st.selectbox(
+                "Mode", _modes,
+                index=_modes.index(state.cfg_mode),
+                key="exp_input_mode", disabled=disabled,
+                filter_mode=None,
+            )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        start_clicked = st.button(
-            "Start", disabled=disabled, use_container_width=True, type="primary",
-        )
-    with col2:
-        stop_clicked = st.button(
-            "Stop", disabled=not disabled, use_container_width=True,
-        )
+        col1, col2 = st.columns(2)
+        with col1:
+            start_clicked = st.button(
+                "Start", disabled=disabled, use_container_width=True, type="primary",
+            )
+        with col2:
+            stop_clicked = st.button(
+                "Stop", disabled=not disabled, use_container_width=True,
+            )
 
-    if start_clicked and not st.session_state.exp_running:
-        st.session_state.exp_cfg_base_url = str(base_url)
-        st.session_state.exp_cfg_interval_ms = int(interval_ms)
-        st.session_state.exp_cfg_mode = str(mode)
-        st.session_state.exp_selected_id = None
-        st.session_state.exp_expanded = None
-        st.session_state.exp_device_filter = None
-        st.session_state.exp_last_error = None
-        explorer = MtConnectExplorer(
-            MtConnectClientConfiguration(base_url=str(base_url)),
-            interval_ms=int(interval_ms),
-            mode=str(mode),
-        ).start()
-        st.session_state.exp_explorer = explorer
-        st.session_state.exp_running = True
-        st.rerun()
+    if start_clicked:
+        # Re-check under the shared lock so two users can't both launch.
+        with get_state_lock():
+            if not state.running:
+                global_state.base_url = str(base_url)
+                state.cfg_interval_ms = int(interval_ms)
+                state.cfg_mode = str(mode)
+                state.selected_id = None
+                state.expanded = None
+                state.device_filter = None
+                state.node_filter = ""
+                state.last_error = None
+                explorer = MtConnectExplorer(
+                    MtConnectClientConfiguration(base_url=str(base_url)),
+                    interval_ms=int(interval_ms),
+                    mode=str(mode),
+                ).start()
+                state.explorer = explorer
+                state.running = True
+                st.rerun()
 
-    if stop_clicked and st.session_state.exp_running:
-        explorer = st.session_state.exp_explorer
-        if explorer:
-            explorer.stop()
-        st.session_state.exp_explorer = None
-        st.session_state.exp_running = False
-        st.rerun()
+    if stop_clicked:
+        with get_state_lock():
+            if state.running:
+                explorer = state.explorer
+                if explorer:
+                    explorer.stop()
+                state.explorer = None
+                state.running = False
+                st.rerun()
 
     # Auto-stop if explorer thread died
-    if st.session_state.exp_running and st.session_state.exp_explorer:
-        _explorer: MtConnectExplorer = st.session_state.exp_explorer
+    if state.running and state.explorer:
+        _explorer: MtConnectExplorer = state.explorer
         if not _explorer.is_alive:
-            st.session_state.exp_last_error = _explorer.error or "Connection lost."
-            st.session_state.exp_running = False
-            st.session_state.exp_explorer = None
+            state.last_error = _explorer.error or "Connection lost."
+            state.running = False
+            state.explorer = None
             st.rerun()
 
-    explorer: Optional[MtConnectExplorer] = st.session_state.get("exp_explorer")
+    explorer: Optional[MtConnectExplorer] = state.explorer
     if explorer is None:
-        if not st.session_state.exp_running:
-            if st.session_state.exp_last_error:
-                st.error(f"Connection lost: {st.session_state.exp_last_error}")
+        if not state.running:
+            if state.last_error:
+                st.error(f"Connection lost: {state.last_error}")
             else:
                 st.info("Configure the connection above and click **Start** to explore the MTConnect agent.")
         return
@@ -367,48 +411,78 @@ def explore_page() -> None:
             (t.label for t in trees),
             key=lambda lbl: (lbl == "Agent", lbl),
         )
-        if st.session_state.exp_device_filter not in device_labels:
-            st.session_state.exp_device_filter = device_labels[0] if device_labels else None
+        if state.device_filter not in device_labels:
+            state.device_filter = device_labels[0] if device_labels else None
 
         selected_device = st.selectbox(
             "Device",
             device_labels,
-            index=device_labels.index(st.session_state.exp_device_filter)
-            if st.session_state.exp_device_filter in device_labels else 0,
+            index=device_labels.index(state.device_filter)
+            if state.device_filter in device_labels else 0,
             key="exp_device_select",
             filter_mode=None,
         )
-        if selected_device != st.session_state.exp_device_filter:
-            st.session_state.exp_device_filter = selected_device
-            st.session_state.exp_selected_id = None
-            st.session_state.exp_expanded = None
+        if selected_device != state.device_filter:
+            state.device_filter = selected_device
+            state.selected_id = None
+            state.expanded = None
 
-        filtered_trees = [t for t in trees if t.label == selected_device]
+        node_filter = st.text_input(
+            "Filter",
+            value=state.node_filter,
+            key="exp_node_filter_input",
+            placeholder="Filter nodes by name or id…",
+        )
+        if node_filter != state.node_filter:
+            state.node_filter = node_filter
+            state.expanded = None
+
+        device_trees = [t for t in trees if t.label == selected_device]
         flat: List[Tuple[TreeNode, int]] = []
-        for t in filtered_trees:
+        for t in device_trees:
             flat.extend(_flatten(t, 0))
 
         id_to_node: Dict[str, TreeNode] = {n.id: n for n, _ in flat}
-        select_nodes = [_to_select_node(t) for t in filtered_trees]
 
-        if st.session_state.exp_expanded is None:
-            st.session_state.exp_expanded = [n.id for n, _ in flat if not n.is_data_item]
+        # Apply the text filter to produce the trees actually shown in the widget.
+        query = state.node_filter.strip().lower()
+        if query:
+            display_trees = [
+                ft for ft in (_filter_tree(t, query) for t in device_trees) if ft
+            ]
+        else:
+            display_trees = device_trees
 
-        if st.session_state.exp_selected_id not in id_to_node:
-            st.session_state.exp_selected_id = flat[0][0].id if flat else None
+        display_flat: List[Tuple[TreeNode, int]] = []
+        for t in display_trees:
+            display_flat.extend(_flatten(t, 0))
 
-        prev_selected = st.session_state.exp_selected_id
+        select_nodes = [_to_select_node(t) for t in display_trees]
+
+        if state.expanded is None:
+            state.expanded = [
+                n.id for n, _ in display_flat if not n.is_data_item
+            ]
+
+        if state.selected_id not in id_to_node:
+            state.selected_id = flat[0][0].id if flat else None
+
+        prev_selected = state.selected_id
         prev_checked = [prev_selected] if prev_selected else []
         tree_key = f"exp_tree_{prev_selected or 'init'}"
 
         with st.container(height=600, border=False):
-            result = tree_select(
-                nodes=select_nodes,
-                checked=prev_checked,
-                no_cascade=True,
-                expanded=st.session_state.exp_expanded,
-                key=tree_key,
-            )
+            if query and not select_nodes:
+                st.caption("No nodes match the filter.")
+                result = {"checked": prev_checked, "expanded": state.expanded}
+            else:
+                result = tree_select(
+                    nodes=select_nodes,
+                    checked=prev_checked,
+                    no_cascade=True,
+                    expanded=state.expanded,
+                    key=tree_key,
+                )
 
         new_checked: List[str] = result.get("checked", [])
         new_expanded: List[str] = result.get("expanded", [])
@@ -416,15 +490,15 @@ def explore_page() -> None:
         if new_checked != prev_checked:
             added = [x for x in new_checked if x not in prev_checked]
             if added:
-                st.session_state.exp_selected_id = added[-1]
+                state.selected_id = added[-1]
             elif new_checked:
-                st.session_state.exp_selected_id = new_checked[-1]
+                state.selected_id = new_checked[-1]
 
-        st.session_state.exp_expanded = new_expanded
+        state.expanded = new_expanded
 
     # ---- Detail column ----
     with detail_col:
-        node = id_to_node.get(st.session_state.exp_selected_id)
+        node = id_to_node.get(state.selected_id)
         if node is None:
             st.info("Select a node in the tree.")
         else:
@@ -456,27 +530,27 @@ def explore_page() -> None:
                         with hc1:
                             w_val = st.number_input(
                                 "Duration", min_value=1, step=1,
-                                value=st.session_state.exp_hist_window_val,
+                                value=state.hist_window_val,
                                 key="exp_hist_val",
                             )
                         with hc2:
                             w_unit = st.selectbox(
                                 "Unit", _HIST_UNITS,
-                                index=_HIST_UNITS.index(st.session_state.exp_hist_window_unit),
+                                index=_HIST_UNITS.index(state.hist_window_unit),
                                 key="exp_hist_unit",
                                 filter_mode=None,
                             )
-                        st.session_state.exp_hist_window_val = int(w_val)
-                        st.session_state.exp_hist_window_unit = w_unit
+                        state.hist_window_val = int(w_val)
+                        state.hist_window_unit = w_unit
                         _render_history(history, timedelta(**{w_unit: int(w_val)}))
 
-                    is_pinned = node.id in st.session_state.exp_pinned_items
+                    is_pinned = node.id in state.pinned_items
                     if st.button(
                         "✓ In Pinned Plots" if is_pinned else "+ Add to Pinned Plots",
                         key="exp_add_pin",
                         disabled=is_pinned,
                     ):
-                        st.session_state.exp_pinned_items.append(node.id)
+                        state.pinned_items.append(node.id)
                         st.rerun()
                 else:
                     st.caption("No observation received yet.")
@@ -500,7 +574,7 @@ def explore_page() -> None:
                         })
                     st.dataframe(rows, width="stretch", hide_index=True)
 
-    pinned = st.session_state.exp_pinned_items
+    pinned = state.pinned_items
     if pinned:
         st.markdown("---")
         st.subheader("Pinned Plots")
@@ -508,19 +582,23 @@ def explore_page() -> None:
         with ph1:
             pin_w_val = st.number_input(
                 "Duration", min_value=1, step=1,
-                value=st.session_state.exp_pin_window_val,
+                value=state.pin_window_val,
                 key="exp_pin_hist_val",
             )
         with ph2:
             pin_w_unit = st.selectbox(
                 "Unit", _HIST_UNITS,
-                index=_HIST_UNITS.index(st.session_state.exp_pin_window_unit),
+                index=_HIST_UNITS.index(state.pin_window_unit),
                 key="exp_pin_hist_unit",
                 filter_mode=None,
             )
-        st.session_state.exp_pin_window_val = int(pin_w_val)
-        st.session_state.exp_pin_window_unit = pin_w_unit
+        state.pin_window_val = int(pin_w_val)
+        state.pin_window_unit = pin_w_unit
         window = timedelta(**{pin_w_unit: int(pin_w_val)})
+        # Anchor every pinned plot to the same wall-clock "now" so they share an
+        # identical X range ([now - window, now]) and the right edge keeps moving
+        # even for DataItems that aren't currently receiving new data.
+        pin_x_max = datetime.now(tz=timezone.utc)
         for item_id in list(pinned):
             pin_node = all_id_to_node.get(item_id)
             label = pin_node.label if pin_node else item_id
@@ -529,14 +607,14 @@ def explore_page() -> None:
                 st.markdown(f"**{label}**" + (f" — {pin_node.tag}" if pin_node else ""))
             with pc2:
                 if st.button("Remove", key=f"exp_rm_{item_id}"):
-                    st.session_state.exp_pinned_items.remove(item_id)
+                    state.pinned_items.remove(item_id)
                     st.rerun()
             pin_history = explorer.get_history(item_id)
             if len(pin_history) > 1:
-                _render_history(pin_history, window)
+                _render_history(pin_history, window, x_max=pin_x_max)
             else:
                 st.caption("No history data yet.")
 
-    if st.session_state.exp_running:
+    if state.running:
         time.sleep(0.5)
         st.rerun()
