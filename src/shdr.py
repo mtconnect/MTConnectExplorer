@@ -104,6 +104,7 @@ class ShdrTable(ShdrObservation):
     A TABLE observation (nested key=value rows).
 
     Set reset_triggered to a trigger name to reset the table.
+    An empty row (no cells) is emitted as a key-only token, which deletes that row.
     """
 
     name: str
@@ -115,8 +116,11 @@ class ShdrTable(ShdrObservation):
         if self.reset_triggered:
             parts.append(f":{self.reset_triggered}")
         for row_key, row_vals in self.rows.items():
-            inner = " ".join(f"{k}={v}" for k, v in row_vals.items())
-            parts.append(f"{row_key}={{{inner}}}")
+            if not row_vals:
+                parts.append(row_key)  # empty row → delete
+            else:
+                inner = " ".join(f"{k}={v}" for k, v in row_vals.items())
+                parts.append(f"{row_key}={{{inner}}}")
         return f"{self._ts()}|{self.name}|{' '.join(parts)}"
 
 
