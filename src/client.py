@@ -16,9 +16,37 @@ from .dataset import DataFrame, DatasetWriter
 logger = logging.getLogger(__name__)
 
 
+class MtConnectCell(BaseModel):
+    key: str = Field(
+        description="Cell key attribute"
+    )
+    text: Optional[str] = Field(
+        None,
+        description="Cell value (XML tag text)"
+    )
+
+
+class MtConnectEntry(BaseModel):
+    key: str = Field(
+        description="Entry key attribute"
+    )
+    removed: bool = Field(
+        False,
+        description="Whether this entry was removed (removed=\"true\")"
+    )
+    text: Optional[str] = Field(
+        None,
+        description="Entry value for a DATA_SET (XML tag text)"
+    )
+    cells: List[MtConnectCell] = Field(
+        default_factory=list,
+        description="Cells for a TABLE entry (empty for a DATA_SET)"
+    )
+
+
 class MtConnectObservation(BaseModel):
     timestamp: Annotated[
-        datetime, 
+        datetime,
         PlainSerializer(lambda dt: dt.isoformat(timespec="milliseconds"), return_type=str)
     ] = Field(
         description="Timestamp attribute",
@@ -34,6 +62,10 @@ class MtConnectObservation(BaseModel):
     )
     sequence: Optional[int] = Field(
         description="Sequence Number"
+    )
+    entries: List[MtConnectEntry] = Field(
+        default_factory=list,
+        description="Entries for DATA_SET / TABLE representations (empty otherwise)"
     )
 
 
@@ -162,6 +194,7 @@ class MtConnectClientFrame(BaseModel):
                     attributes=el.attrib,
                     text=el.text,
                     sequence=el.attrib.get("sequence"),
+                    entries=self._parse_entries(el),
                 ))
             devices.append(MtConnectDeviceStream(
                 id=stream_el.attrib.get("id", ""),
@@ -191,6 +224,7 @@ class MtConnectClientFrame(BaseModel):
                 attributes=el.attrib,
                 text=el.text,
                 sequence=el.attrib.get("sequence"),
+                entries=self._parse_entries(el),
             ))
 
         # TODO: need to sort by timestamp and/or sequence
@@ -203,12 +237,37 @@ class MtConnectClientFrame(BaseModel):
             # Remove namespace from tag
             if '}' in elem.tag:
                 elem.tag = elem.tag.split('}', 1)[1]
-            
+
             # Remove namespace from attributes
             for attr in list(elem.attrib.keys()):
                 if '}' in attr:
                     new_attr = attr.split('}', 1)[1]
                     elem.attrib[new_attr] = elem.attrib.pop(attr)
+
+    @staticmethod
+    def _parse_entries(el) -> List[MtConnectEntry]:
+        """Parse the <Entry>/<Cell> children of a DATA_SET or TABLE observation
+        element. Handles namespaced or namespace-stripped tags. Returns an empty
+        list for VALUE / non-set observations."""
+        entries: List[MtConnectEntry] = []
+        for child in el:
+            if child.tag.split("}")[-1] != "Entry":
+                continue
+            cells: List[MtConnectCell] = []
+            for cell in child:
+                if cell.tag.split("}")[-1] != "Cell":
+                    continue
+                cells.append(MtConnectCell(
+                    key=cell.attrib.get("key", ""),
+                    text=cell.text,
+                ))
+            entries.append(MtConnectEntry(
+                key=child.attrib.get("key", ""),
+                removed=child.attrib.get("removed") == "true",
+                text=child.text,
+                cells=cells,
+            ))
+        return entries
 
 
 class MtConnectStreamReader:

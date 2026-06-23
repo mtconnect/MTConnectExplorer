@@ -263,30 +263,45 @@ class XmlToShdrConverter:
                 frequency=float(sample_rate) if sample_rate is not None else None,
             )
         
-        if representation == "DATA_SET":
-            raise NotImplementedError(f"Representation: {representation} not implemented")
+        # DATA_SET / TABLE observations are identified by their <Entry>/<Cell>
+        # structure: MTConnect streams carry the entries directly and do NOT repeat
+        # the `representation` attribute, so we detect by structure (and honour the
+        # attribute too, on the chance an agent does include it).
+        if obs.entries or representation in ("DATA_SET", "TABLE"):
+            # No entries + UNAVAILABLE text → emit a plain UNAVAILABLE.
+            if not obs.entries and (obs.text or "").strip().upper() == "UNAVAILABLE":
+                return ShdrDataItem(timestamp=timestamp, name=name, value=None)
+
+            reset_triggered = obs.attributes.get("resetTriggered")
+
+            # A TABLE has <Cell> children inside its entries; a DATA_SET does not.
+            if representation == "TABLE" or any(entry.cells for entry in obs.entries):
+                # A removed entry becomes an empty row, rendered as a key-only removal.
+                rows = {
+                    entry.key: (
+                        {} if entry.removed
+                        else {cell.key: cell.text for cell in entry.cells}
+                    )
+                    for entry in obs.entries
+                }
+                return ShdrTable(
+                    timestamp=timestamp,
+                    name=name,
+                    rows=rows,
+                    reset_triggered=reset_triggered,
+                )
+
+            # DATA_SET: each <Entry key="...">value</Entry>; a removed entry becomes
+            # None, which the SHDR data set renders as a key-only removal.
             entries = {
-                entry.attrib["key"]: None if entry.attrib.get("removed") == "true" else entry.text
-                for entry in el
+                entry.key: (None if entry.removed else entry.text)
+                for entry in obs.entries
             }
             return ShdrDataSet(
                 timestamp=timestamp,
                 name=name,
                 entries=entries,
-                reset_triggered=obs.attributes.get("resetTriggered"),
-            )
-        
-        if representation == "TABLE":
-            raise NotImplementedError(f"Representation: {representation} not implemented")
-            rows = {
-                entry.attrib["key"]: {cell.attrib["key"]: cell.text for cell in entry}
-                for entry in el
-            }
-            return ShdrTable(
-                timestamp=timestamp,
-                name=name,
-                rows=rows,
-                reset_triggered=obs.attributes.get("resetTriggered"),
+                reset_triggered=reset_triggered,
             )
         
         return ShdrDataItem(
