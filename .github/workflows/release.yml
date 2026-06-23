@@ -1,0 +1,195 @@
+name: Release
+
+on:
+  push:
+    branches: ['release-*']
+    paths: ['src/__version__.py']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.derive.outputs.tag }}
+      version: ${{ steps.derive.outputs.version }}
+      minor: ${{ steps.derive.outputs.minor }}
+      prerelease: ${{ steps.derive.outputs.prerelease }}
+      should_release: ${{ steps.derive.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: derive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          branch="${GITHUB_REF_NAME}"
+
+          # Read __version__ from src/__version__.py
+          version=$(grep -oP '"\K[^"]+' src/__version__.py)
+          if [ -z "$version" ]; then
+            echo "::error::Failed to parse __version__ from src/__version__.py"
+            exit 1
+          fi
+
+          # Validate semver
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::__version__ '$version' is not valid semver (expected MAJOR.MINOR.PATCH[-PRERELEASE])"
+            exit 1
+          fi
+
+          tag="v$version"
+
+          # Validate branch name matches the version's X.Y line
+          if [[ "$branch" =~ ^release-([0-9]+)\.([0-9]+)$ ]]; then
+            expected_minor="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+            actual_minor=$(echo "$version" | cut -d'-' -f1 | cut -d. -f1-2)
+            if [ "$expected_minor" != "$actual_minor" ]; then
+              echo "::error::Branch '$branch' expects version $expected_minor.x, but __version__ is '$version'"
+              exit 1
+            fi
+          else
+            echo "::error::Branch '$branch' is not a release branch (expected 'release-X.Y')"
+            exit 1
+          fi
+
+          # Semver: presence of a `-` suffix marks this as a prerelease.
+          if [[ "$tag" == *-* ]]; then
+            prerelease=true
+          else
+            prerelease=false
+          fi
+
+          # On a `push` trigger, skip if the tag already exists on the remote — this
+          # commit didn't actually bump the version (e.g. a revert or a no-op edit).
+          # On `workflow_dispatch`, always proceed so broken releases can be re-run.
+          should_release=true
+          if [ "${{ github.event_name }}" = "push" ]; then
+            if git ls-remote --tags origin "refs/tags/$tag" | grep -q "refs/tags/$tag"; then
+              echo "::notice::Tag $tag already exists on remote — skipping (use workflow_dispatch to re-run)"
+              should_release=false
+            fi
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "minor=$expected_minor"
+            echo "prerelease=$prerelease"
+            echo "should_release=$should_release"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Branch:         $branch"
+          echo "Version:        $version"
+          echo "Tag:            $tag"
+          echo "Prerelease:     $prerelease"
+          echo "Should release: $should_release"
+
+  build-linux:
+    needs: version
+    if: needs.version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    env:
+      ARCHIVE: MTConnectExplorer-v${{ needs.version.outputs.version }}-linux-x86_64.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build with make
+        run: make
+      - name: Package tar.gz
+        run: |
+          test -f dist/MTConnectExplorer
+          chmod +x dist/MTConnectExplorer
+          tar -czvf "$ARCHIVE" -C dist MTConnectExplorer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  build-windows:
+    needs: version
+    if: needs.version.outputs.should_release == 'true'
+    runs-on: windows-latest
+    env:
+      ARCHIVE: MTConnectExplorer-v${{ needs.version.outputs.version }}-win64.zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build with build.bat
+        shell: cmd
+        run: build.bat ci
+      - name: Package zip
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist\MTConnectExplorer.exe)) {
+            throw "dist\MTConnectExplorer.exe not found"
+          }
+          Compress-Archive -Path dist\MTConnectExplorer.exe -DestinationPath "$env:ARCHIVE" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  release:
+    needs: [version, build-linux, build-windows]
+    if: needs.version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -la artifacts/
+      - name: Create and push tag
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q "refs/tags/$TAG"; then
+            echo "Tag $TAG already exists on remote — reusing"
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
+          prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
+          files: artifacts/*
+          fail_on_unmatched_files: true
+      - name: Create dev-X.Y staging branch for this line
+        env:
+          DEV: dev-${{ needs.version.outputs.minor }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # The dev-X.Y staging branch is seeded from the first *stable* release of
+          # the line, so it never lags behind release-X.Y at a prerelease commit.
+          if [ "$PRERELEASE" = "true" ]; then
+            echo "::notice::${{ needs.version.outputs.tag }} is a prerelease — $DEV is created on the first stable release, skipping"
+            exit 0
+          fi
+          if git ls-remote --heads origin "refs/heads/$DEV" | grep -q "refs/heads/$DEV"; then
+            echo "::notice::$DEV already exists — leaving it untouched"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git push origin "HEAD:refs/heads/$DEV"
+            echo "::notice::Created $DEV at $GITHUB_SHA"
+          fi

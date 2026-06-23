@@ -1,0 +1,10 @@
+__pycache__/
+.claude/
+build/
+datasets/
+dist/
+src/bin/
+test/
+venv/
+
+config.json
