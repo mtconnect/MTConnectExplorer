@@ -32,6 +32,9 @@ class MtConnectObservation(BaseModel):
     text: Optional[str] = Field(
         description="XML Tag Text"
     )
+    sequence: Optional[int] = Field(
+        description="Sequence Number"
+    )
 
 
 class MtConnectDevice(BaseModel):
@@ -158,6 +161,7 @@ class MtConnectClientFrame(BaseModel):
                     tag=el.tag.split("}")[-1],
                     attributes=el.attrib,
                     text=el.text,
+                    sequence=el.attrib.get("sequence"),
                 ))
             devices.append(MtConnectDeviceStream(
                 id=stream_el.attrib.get("id", ""),
@@ -186,6 +190,7 @@ class MtConnectClientFrame(BaseModel):
                 tag=el.tag.split("}")[-1],
                 attributes=el.attrib,
                 text=el.text,
+                sequence=el.attrib.get("sequence"),
             ))
 
         # TODO: need to sort by timestamp and/or sequence
@@ -651,10 +656,16 @@ class MtConnectDataCollectorConfiguration(BaseModel):
 
 class MtConnectDataCollector:
 
-    def __init__(self, configuration: MtConnectDataCollectorConfiguration):
+    def __init__(self, configuration: MtConnectDataCollectorConfiguration, thread_name: str = "mtconnect-data-collector"):
         if not isinstance(configuration, MtConnectDataCollectorConfiguration):
             raise TypeError("configuration must be a MtConnectDataCollectorConfiguration")
         self._configuration = configuration
+
+        if not isinstance(thread_name, str):
+            raise TypeError("thread_name must be a str")
+        # Name applied to the collector thread; callers may encode a session
+        # label here so the thread's log records can be attributed to a capture.
+        self._thread_name = thread_name
 
         self._client = MtConnectClient(configuration.configuration)
 
@@ -688,7 +699,7 @@ class MtConnectDataCollector:
             raise RuntimeError("MtConnectDataCollector is already started")
         self._thread = threading.Thread(
             target=self._loop,
-            name="mtconnect-data-collector",
+            name=self._thread_name,
             daemon=True,
         )
         self._thread.start()

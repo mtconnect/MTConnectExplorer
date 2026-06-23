@@ -1,0 +1,5 @@
+# Streamlit configuration used for `streamlit run src/app.py` (dev).
+# The packaged build sets the same options via flag_options in src/main.py.
+[server]
+# Maximum size (in MB) of a single uploaded dataset file: 5 GB.
+maxUploadSize = 5120

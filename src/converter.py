@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 from typing import Dict, Set, Tuple, List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pydantic import ValidationError
 from pathlib import Path
 
@@ -264,6 +264,7 @@ class XmlToShdrConverter:
             )
         
         if representation == "DATA_SET":
+            raise NotImplementedError(f"Representation: {representation} not implemented")
             entries = {
                 entry.attrib["key"]: None if entry.attrib.get("removed") == "true" else entry.text
                 for entry in el
@@ -276,6 +277,7 @@ class XmlToShdrConverter:
             )
         
         if representation == "TABLE":
+            raise NotImplementedError(f"Representation: {representation} not implemented")
             rows = {
                 entry.attrib["key"]: {cell.attrib["key"]: cell.text for cell in entry}
                 for entry in el
@@ -341,15 +343,39 @@ class MtConnectDatasetReader:
 
 class MtConnectDatasetPlayer:
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 7878):
+    def __init__(self, host: str = "127.0.0.1", port: int = 7878, re_timestamp: bool = True, loop: bool = True, thread_name: str = "dataset-player"):
         if not isinstance(host, str):
             raise TypeError("host must be a str")
         self._host = host
 
         if not isinstance(port, int):
             raise TypeError("port must be an int")
-        self._port = port  
+        self._port = port
 
+        if not isinstance(thread_name, str):
+            raise TypeError("thread_name must be a str")
+        # Name applied to the playback thread; callers may encode a session label
+        # here so the thread's log records can be attributed to a playback.
+        self._thread_name = thread_name
+
+        if not isinstance(re_timestamp, bool):
+            raise TypeError("re_timestamp must be a bool")
+        # When True, recorded observation timestamps are replaced on emit with a
+        # time offset from the play start equal to the frame's original offset
+        # from the first frame (data appears "live"). When False, original
+        # timestamps are kept.
+        self._re_timestamp = re_timestamp
+
+        if not isinstance(loop, bool):
+            raise TypeError("loop must be a bool")
+        # When True, playback repeats from the start once the dataset is
+        # exhausted. The device-model (probe) line is only consumed on the first
+        # pass; subsequent passes skip it and replay observations only.
+        # NB: not named ``self._loop`` so it does not shadow the _loop() method.
+        self._loop_enabled = loop
+
+        self._file_path: Optional[str] = None
+        self._device_name: Optional[str] = None
         self._reader: Optional[MtConnectDatasetReader] = None
 
         self._thread: Optional[threading.Thread] = None
@@ -373,7 +399,9 @@ class MtConnectDatasetPlayer:
 
         if self._reader is not None or self._thread is not None:
             raise RuntimeError("Already playing")
-        
+
+        self._file_path = file_path
+        self._device_name = device_name
         self._reader = MtConnectDatasetReader(device_name).open(file_path)
         self._adapter = ShdrAdapter(
             ShdrAdapterConfiguration(
@@ -396,13 +424,14 @@ class MtConnectDatasetPlayer:
         self._is_finished = False
         self._thread = threading.Thread(
             target=self._loop,
-            name="dataset-player",
+            name=self._thread_name,
             daemon=True,
         )
         self._thread.start()
 
 
     def stop(self) -> None:
+        self._stop_event.set()
         if self._reader is not None:
             self._reader.close()
             self._reader = None
@@ -415,34 +444,89 @@ class MtConnectDatasetPlayer:
             self._is_alive = True
             self._is_finished = False
             start = datetime.now(timezone.utc)
-            frame_start: Optional[datetime] = None
+            # Cumulative dataset duration of all completed passes. Frame offsets
+            # are scheduled and re-stamped relative to (start + elapsed_offset)
+            # so looping playback advances monotonically without resetting time.
+            elapsed_offset = timedelta(0)
+            first_pass = True
+            loop_number = 1
             logger.debug("Thread started")
 
-            while not self._reader.is_finished:
-                if self._stop_event.is_set():
-                    logger.debug("Thread stop received")
-                    break
+            while not self._stop_event.is_set():
+                # Obtain a reader positioned at the first observation frame. The
+                # first pass reuses the reader opened in open() (probe already
+                # consumed); later passes re-open and discard the probe line.
+                if first_pass:
+                    reader = self._reader
+                    first_pass = False
+                else:
+                    reader = MtConnectDatasetReader(self._device_name).open(self._file_path)
+                    reader.read_probe_device_model()  # discard device-model (probe) line
+                    self._reader = reader
 
-                # Get the next frame and determine when it should be played
-                delta = datetime.now(timezone.utc) - start
-                frame_timestamp, frame_observations = self._reader.read()
-                if frame_start is None:
-                    frame_start = frame_timestamp
-                frame_delta = frame_timestamp - frame_start
-                
-                if frame_delta.total_seconds() > 120: # 2 minutes
-                    raise Exception(f"Invalid frame_delta: {frame_delta}")
+                if self._loop_enabled:
+                    logger.info(f"Playback loop {loop_number}")
 
-                # Wait for frame time
-                while frame_delta > delta:
+                pass_frame_start: Optional[datetime] = None
+                pass_last_offset = timedelta(0)
+
+                while not reader.is_finished:
                     if self._stop_event.is_set():
                         logger.debug("Thread stop received")
-                        return
-                    time.sleep(0.001)
-                    delta = datetime.now(timezone.utc) - start
+                        break
 
-                self._adapter.enqueue(frame_observations)
-                logger.debug(f"Enqueued {len(frame_observations)} SHDR observations.")
+                    frame_timestamp, frame_observations = reader.read()
+                    if pass_frame_start is None:
+                        pass_frame_start = frame_timestamp
+                    frame_offset = frame_timestamp - pass_frame_start
+
+                    # If there is a lot of time between frames, there is likely an issue with the data.
+                    max_frame_delta_minutes = 10
+                    if frame_offset.total_seconds() > (max_frame_delta_minutes * 60):
+                        raise Exception(f"frame_delta '{frame_offset}' is greater than the maximum of '{max_frame_delta_minutes}' minutes.")
+
+                    total_delta = elapsed_offset + frame_offset
+
+                    # Wait for frame time
+                    delta = datetime.now(timezone.utc) - start
+                    while total_delta > delta:
+                        if self._stop_event.is_set():
+                            logger.debug("Thread stop received")
+                            return
+                        time.sleep(0.001)
+                        delta = datetime.now(timezone.utc) - start
+
+                    # Re-stamp relative to the play start so each frame's offset
+                    # from the start of playback exactly matches its original
+                    # offset (carried forward across loops by elapsed_offset).
+                    # Using the actual emit time (datetime.now) would drift by the
+                    # scheduling jitter accumulated up to this frame.
+                    if self._re_timestamp:
+                        new_ts = start + total_delta
+                        frame_observations = [
+                            o.model_copy(update={"timestamp": new_ts}) for o in frame_observations
+                        ]
+
+                    self._adapter.enqueue(frame_observations)
+                    logger.debug(f"Enqueued {len(frame_observations)} SHDR observations.")
+                    pass_last_offset = frame_offset
+
+                # Pass complete. Stop here unless looping is enabled.
+                if self._stop_event.is_set() or not self._loop_enabled:
+                    break
+
+                # An empty pass (no observation frames) would otherwise spin the
+                # loop; treat it as the end of playback.
+                if pass_frame_start is None:
+                    logger.debug("No observation frames to loop; stopping")
+                    break
+
+                # Carry this pass's duration forward so the next pass continues
+                # seamlessly from where this one ended.
+                elapsed_offset += pass_last_offset
+                reader.close()
+                loop_number += 1
+                logger.debug("Looping dataset playback")
 
             self._is_finished = True
             logger.debug("Player finished")
