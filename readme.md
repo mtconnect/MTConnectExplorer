@@ -5,10 +5,6 @@
 > This application is an early stage prototype. Use with caution.
 
 
-> [!WARNING]
-> While `DATA_SET` and `TABLE` DataItems can be captured, replay of `DATA_SET` and `TABLE` DataItems have not yet been implemented.
-
-
 MTConnectExplorer is a utility for:
 
 1. Viewing the data provided by an [MTConnect Agent](https://github.com/mtconnect/cppagent).
