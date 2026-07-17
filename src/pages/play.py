@@ -13,6 +13,7 @@ from src.pages.core import (
     PlaybackSession,
     PlayPageState,
     agent_url,
+    all_used_ports,
     attach_session_log,
     detach_log,
     drain,
@@ -106,11 +107,9 @@ def _next_free_port(start: int, used: set) -> int:
 
 
 def _used_ports(state: PlayPageState) -> set:
-    used: set = set()
-    for s in state.sessions.values():
-        used.add(s.config.agent_port)
-        used.add(s.config.player_port)
-    return used
+    # Ports are de-conflicted across BOTH Play and Simulator sessions so a
+    # playback and a simulation can never collide on the same agent/SHDR port.
+    return all_used_ports()
 
 
 def _sync_log_handler(state: PlayPageState) -> None:

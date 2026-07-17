@@ -17,6 +17,7 @@ from src.client import (
     MtConnectExplorer,
 )
 from src.shdr import ShdrDataPlayer
+from src.simulator import EquipmentType, EquipmentSimulator
 
 DATASETS_DIR = Path("datasets")
 _LOG_FMT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -452,6 +453,119 @@ class PlayPageState(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Simulator page
+#
+# Like the Play page, but the data source is generated on the fly (a canned
+# routine for a virtual mill or robot) instead of a recorded dataset. Each
+# session owns its own agent + SHDR adapter + EquipmentSimulator worker.
+# ---------------------------------------------------------------------------
+class SimulatorConfig(BaseModel):
+    """Configuration captured from the Simulator page form."""
+
+    equipment_type: str = Field(
+        EquipmentType.MILL_3AXIS.value,
+        description="Equipment type key (see EquipmentType): MILL_3AXIS or ROBOT_6DOF.",
+    )
+    device_name: str = Field(
+        "",
+        description="MTConnect device name for the simulated equipment.",
+    )
+    routine: str = Field(
+        "",
+        description="Label of the selected canned routine.",
+    )
+    tick_ms: int = Field(
+        30,
+        description="Interval in milliseconds at which generated observations are fed "
+        "to the SHDR adapter.",
+    )
+    agent_port: int = Field(
+        AgentConfig.model_fields["port"].default,
+        description="MTConnect agent HTTP port",
+    )
+    mtconnect_version: str = Field(
+        AgentConfig.model_fields["mtconnect_version"].default,
+        description="MTConnect version string",
+    )
+    asset_buffer_size: int = Field(
+        AgentConfig.model_fields["asset_buffer_size"].default,
+        description="Agent asset buffer size",
+    )
+    buffer_size: int = Field(
+        AgentConfig.model_fields["buffer_size"].default,
+        description="Agent circular buffer size",
+    )
+    player_host: str = Field(
+        AgentAdapter.model_fields["host"].default,
+        description="SHDR adapter host address",
+    )
+    player_port: int = Field(
+        AgentAdapter.model_fields["port"].default,
+        description="SHDR adapter port",
+    )
+
+
+class SimulatorSession(BaseModel):
+    """A single in-flight simulation (its own agent, SHDR adapter, worker)."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    id: str = Field(
+        description="Unique identifier for this simulation session.",
+    )
+    label: str = Field(
+        description="Human-readable label (equipment | device | agent URL) used to tag log lines.",
+    )
+    config: SimulatorConfig = Field(
+        description="Simulation configuration applied to this session.",
+    )
+    simulator: Optional[EquipmentSimulator] = Field(
+        None,
+        description="The EquipmentSimulator for this session (owns the SHDR adapter + routine). "
+        "Held here so the 3D visualization can read its routine spec and start time.",
+    )
+    worker: Optional[threading.Thread] = Field(
+        None,
+        description="Background thread running this session's agent and simulator.",
+    )
+    stop_event: Optional[threading.Event] = Field(
+        None,
+        description="Event used to signal this session's worker thread to stop.",
+    )
+
+
+class SimulatorPageState(BaseModel):
+    """Session state for the Simulator page (supports multiple simultaneous simulations)."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    config: SimulatorConfig = Field(
+        default_factory=SimulatorConfig,
+        description="Default/last-used configuration shown in the launch form.",
+    )
+    sessions: Dict[str, SimulatorSession] = Field(
+        default_factory=dict,
+        description="Active simulation sessions, keyed by session id.",
+    )
+    next_id: int = Field(
+        1,
+        description="Monotonic counter used to assign unique session ids.",
+    )
+    log_q: queue.Queue = Field(
+        default_factory=queue.Queue,
+        description="Thread-safe queue receiving consolidated log records from all sessions.",
+    )
+    log_lines: List[str] = Field(
+        default_factory=list,
+        description="Accumulated consolidated log lines shown in the Log Output area.",
+    )
+    handler: Optional[logging.Handler] = Field(
+        None,
+        description="Consolidated logging handler, attached while any session is active.",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Shared, process-global state store
 #
 # st.session_state is per-session, so it does not survive browser reloads and is
@@ -508,3 +622,32 @@ def get_datasets_state() -> DatasetsPageState:
 
 def get_play_state() -> PlayPageState:
     return _get_shared("play_state", PlayPageState)
+
+
+def get_simulator_state() -> SimulatorPageState:
+    return _get_shared("simulator_state", SimulatorPageState)
+
+
+# ---------------------------------------------------------------------------
+# Cross-page helpers — Play and Simulator both spin up local agents, so ports
+# must be de-conflicted across both and running agents surfaced app-wide.
+# ---------------------------------------------------------------------------
+def all_used_ports() -> set:
+    """Agent + SHDR ports in use by every running Play and Simulator session."""
+    used: set = set()
+    for state in (get_play_state(), get_simulator_state()):
+        for s in state.sessions.values():
+            used.add(s.config.agent_port)
+            used.add(s.config.player_port)
+    return used
+
+
+def running_agent_urls() -> List[str]:
+    """Base URLs of all locally-running agents (Play + Simulator), de-duplicated."""
+    urls: List[str] = []
+    for state in (get_play_state(), get_simulator_state()):
+        for s in state.sessions.values():
+            u = agent_url(s.config.agent_port)
+            if u not in urls:
+                urls.append(u)
+    return urls

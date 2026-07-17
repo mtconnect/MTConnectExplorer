@@ -22,9 +22,9 @@ from src.pages.core import (
     drain,
     get_capture_state,
     get_global_state,
-    get_play_state,
     get_state_lock,
     log_area,
+    running_agent_urls,
     session_thread_name,
 )
 
@@ -149,10 +149,10 @@ def capture_page() -> None:
     with form_col:
         st.subheader("Start Capture")
         # Editable dropdown: free-text URL. The default demo URL is always first
-        # and the default selection; only currently-playing agents follow as
-        # quick options (so stopped playbacks don't linger in the list).
-        play_state = get_play_state()
-        playing_urls = [agent_url(s.config.agent_port) for s in play_state.sessions.values()]
+        # and the default selection; currently-running local agents (Play and
+        # Simulator sessions) follow as quick options (so stopped sessions don't
+        # linger in the list).
+        playing_urls = running_agent_urls()
         default_url = GlobalState.model_fields["base_url"].default
         base_url_options: list = []
         for u in [default_url, *playing_urls]:
@@ -165,19 +165,43 @@ def capture_page() -> None:
             accept_new_options=True,
             key="cap_base_url_select",
         )
+        # Interval default depends on the target. The public demo server is
+        # shared, so it defaults to a courteous 1000 ms and is floored there for
+        # every mode (you can set a higher interval, never a lower one) to avoid
+        # accidentally hammering it. Any other agent (typically a local one) can
+        # be polled far faster, so the default depends on the mode; that value is
+        # only a starting point and the user can override it.
+        _MODE_DEFAULT_INTERVAL_MS = {"stream": 10, "sample": 50, "current": 200}
+        _DEMO_MIN_INTERVAL_MS = 1000
+        demo_url = default_url.strip().rstrip("/")
+        is_demo = str(base_url).strip().rstrip("/") == demo_url
+
         c1, c2 = st.columns(2)
+        # Mode (left) is created first: the interval default reads its value.
         with c1:
-            stream_interval_ms = st.number_input(
-                "Interval (ms)", value=config.interval_ms, min_value=1, step=1,
-                key="cap_stream_interval_ms",
-            )
-        with c2:
             _modes = ["stream", "sample", "current"]
             mode = st.selectbox(
                 "Mode", _modes,
                 index=_modes.index(config.mode) if config.mode in _modes else 0,
                 key="cap_mode",
                 filter_mode=None,  # Disable search/text input
+            )
+        with c2:
+            # The key varies with target/mode so switching either re-seeds the
+            # default — Streamlit ignores `value` once a keyed widget has state.
+            if is_demo:
+                interval_value = interval_min = _DEMO_MIN_INTERVAL_MS
+                interval_key = "cap_interval_demo"
+            else:
+                interval_value = _MODE_DEFAULT_INTERVAL_MS.get(mode, 10)
+                interval_min = 1
+                interval_key = f"cap_interval_{mode}"
+            stream_interval_ms = st.number_input(
+                "Interval (ms)", value=interval_value, min_value=interval_min, step=1,
+                key=interval_key,
+                help=("The public demo server is shared: 1000 ms is the minimum "
+                      "(you can set a higher interval) to avoid overloading it."
+                      if is_demo else None),
             )
 
         start_clicked = st.button(

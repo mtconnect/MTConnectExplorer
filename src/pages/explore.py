@@ -308,13 +308,35 @@ def explore_page() -> None:
             key="exp_base_url_select",
             disabled=disabled,
         )
+        # Demo server: floor the interval at 1000 ms (default 1000, higher
+        # allowed) to avoid overloading the shared public server. Any other agent
+        # keeps the plain 1000 ms default for every mode but can be set as low as
+        # 1 ms.
+        _DEMO_MIN_INTERVAL_MS = 1000
+        demo_url = default_url.strip().rstrip("/")
+        is_demo = str(base_url).strip().rstrip("/") == demo_url
+
         col1, col2 = st.columns(2)
-        with col1:
-            interval_ms = st.number_input(
-                "Interval (ms)", value=state.cfg_interval_ms,
-                min_value=1, step=1, key="exp_input_interval", disabled=disabled,
-            )
         with col2:
+            # The key varies with the target so switching to/from the demo server
+            # re-seeds the default — Streamlit ignores `value` (and would error on
+            # a value below a raised min_value) once a keyed widget has state.
+            if is_demo:
+                interval_min = _DEMO_MIN_INTERVAL_MS
+                interval_value = max(int(state.cfg_interval_ms), _DEMO_MIN_INTERVAL_MS)
+                interval_key = "exp_interval_demo"
+            else:
+                interval_min = 1
+                interval_value = int(state.cfg_interval_ms)
+                interval_key = "exp_interval_other"
+            interval_ms = st.number_input(
+                "Interval (ms)", value=interval_value,
+                min_value=interval_min, step=1, key=interval_key, disabled=disabled,
+                help=("The public demo server is shared: 1000 ms is the minimum "
+                      "(you can set a higher interval) to avoid overloading it."
+                      if is_demo else None),
+            )
+        with col1:
             _modes = ["stream", "sample", "current"]
             mode = st.selectbox(
                 "Mode", _modes,
