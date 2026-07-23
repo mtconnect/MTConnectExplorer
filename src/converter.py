@@ -263,30 +263,45 @@ class XmlToShdrConverter:
                 frequency=float(sample_rate) if sample_rate is not None else None,
             )
         
-        if representation == "DATA_SET":
-            raise NotImplementedError(f"Representation: {representation} not implemented")
+        # DATA_SET / TABLE observations are identified by their <Entry>/<Cell>
+        # structure: MTConnect streams carry the entries directly and do NOT repeat
+        # the `representation` attribute, so we detect by structure (and honour the
+        # attribute too, on the chance an agent does include it).
+        if obs.entries or representation in ("DATA_SET", "TABLE"):
+            # No entries + UNAVAILABLE text → emit a plain UNAVAILABLE.
+            if not obs.entries and (obs.text or "").strip().upper() == "UNAVAILABLE":
+                return ShdrDataItem(timestamp=timestamp, name=name, value=None)
+
+            reset_triggered = obs.attributes.get("resetTriggered")
+
+            # A TABLE has <Cell> children inside its entries; a DATA_SET does not.
+            if representation == "TABLE" or any(entry.cells for entry in obs.entries):
+                # A removed entry becomes an empty row, rendered as a key-only removal.
+                rows = {
+                    entry.key: (
+                        {} if entry.removed
+                        else {cell.key: cell.text for cell in entry.cells}
+                    )
+                    for entry in obs.entries
+                }
+                return ShdrTable(
+                    timestamp=timestamp,
+                    name=name,
+                    rows=rows,
+                    reset_triggered=reset_triggered,
+                )
+
+            # DATA_SET: each <Entry key="...">value</Entry>; a removed entry becomes
+            # None, which the SHDR data set renders as a key-only removal.
             entries = {
-                entry.attrib["key"]: None if entry.attrib.get("removed") == "true" else entry.text
-                for entry in el
+                entry.key: (None if entry.removed else entry.text)
+                for entry in obs.entries
             }
             return ShdrDataSet(
                 timestamp=timestamp,
                 name=name,
                 entries=entries,
-                reset_triggered=obs.attributes.get("resetTriggered"),
-            )
-        
-        if representation == "TABLE":
-            raise NotImplementedError(f"Representation: {representation} not implemented")
-            rows = {
-                entry.attrib["key"]: {cell.attrib["key"]: cell.text for cell in entry}
-                for entry in el
-            }
-            return ShdrTable(
-                timestamp=timestamp,
-                name=name,
-                rows=rows,
-                reset_triggered=obs.attributes.get("resetTriggered"),
+                reset_triggered=reset_triggered,
             )
         
         return ShdrDataItem(
@@ -469,6 +484,7 @@ class MtConnectDatasetPlayer:
 
                 pass_frame_start: Optional[datetime] = None
                 pass_last_offset = timedelta(0)
+                prev_frame_timestamp: Optional[datetime] = None
 
                 while not reader.is_finished:
                     if self._stop_event.is_set():
@@ -480,10 +496,19 @@ class MtConnectDatasetPlayer:
                         pass_frame_start = frame_timestamp
                     frame_offset = frame_timestamp - pass_frame_start
 
-                    # If there is a lot of time between frames, there is likely an issue with the data.
-                    max_frame_delta_minutes = 10
-                    if frame_offset.total_seconds() > (max_frame_delta_minutes * 60):
-                        raise Exception(f"frame_delta '{frame_offset}' is greater than the maximum of '{max_frame_delta_minutes}' minutes.")
+                    # Guard against an absurd GAP between consecutive frames (which
+                    # would otherwise stall paced playback for that long and usually
+                    # signals corrupt/misordered data) — NOT the dataset's total
+                    # length, which is unbounded.
+                    max_gap_minutes = 10
+                    if prev_frame_timestamp is not None:
+                        gap = frame_timestamp - prev_frame_timestamp
+                        if gap.total_seconds() > (max_gap_minutes * 60):
+                            raise Exception(
+                                f"gap between consecutive frames '{gap}' exceeds the maximum "
+                                f"of '{max_gap_minutes}' minutes; the dataset may be corrupt or misordered."
+                            )
+                    prev_frame_timestamp = frame_timestamp
 
                     total_delta = elapsed_offset + frame_offset
 

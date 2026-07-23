@@ -2,12 +2,12 @@ name: CI
 
 # Pre-merge build check. Runs on PRs into the protected staging/release branches
 # so a PR can't merge unless the app still builds on both shipped platforms.
-# Mark `build-linux`, `build-windows`, and (on release-* branches) `version-check`
+# Mark `build-linux`, `build-windows`, and (on release/* branches) `version-check`
 # as required status checks on these branches (see contributing.md → Branch
 # protection rules).
 on:
   pull_request:
-    branches: [main, 'dev-*', 'release-*']
+    branches: [main, 'dev/*', 'release/*']
 
 # A new push to the same PR cancels the in-flight run.
 concurrency:
@@ -19,17 +19,17 @@ permissions:
 
 jobs:
   version-check:
-    # Pre-merge guard for release PRs: a PR into release-X.Y must carry a
+    # Pre-merge guard for release PRs: a PR into release/X.Y must carry a
     # matching X.Y version, so the post-merge release workflow can't fail on a
-    # version/branch mismatch. No-op for PRs into main / dev-*.
-    # Mark as a required status check on release-* branches.
+    # version/branch mismatch. No-op for PRs into main / dev/*.
+    # Mark as a required status check on release/* branches.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Validate __version__ matches the target release branch
         run: |
           base="${{ github.base_ref }}"
-          if [[ ! "$base" =~ ^release-([0-9]+)\.([0-9]+)$ ]]; then
+          if [[ ! "$base" =~ ^release/([0-9]+)\.([0-9]+)$ ]]; then
             echo "Base branch '$base' is not a release branch; skipping version check."
             exit 0
           fi
@@ -49,7 +49,7 @@ jobs:
 
           # Re-match the base branch (the semver test above clobbered BASH_REMATCH)
           # to recover the expected X.Y line, then compare to the version's line.
-          [[ "$base" =~ ^release-([0-9]+)\.([0-9]+)$ ]]
+          [[ "$base" =~ ^release/([0-9]+)\.([0-9]+)$ ]]
           expected_minor="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
           actual_minor=$(echo "$version" | cut -d'-' -f1 | cut -d. -f1-2)
           if [ "$expected_minor" != "$actual_minor" ]; then

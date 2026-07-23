@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    branches: ['release-*']
+    branches: ['release/*']
     paths: ['src/__version__.py']
   workflow_dispatch:
 
@@ -45,7 +45,7 @@ jobs:
           tag="v$version"
 
           # Validate branch name matches the version's X.Y line
-          if [[ "$branch" =~ ^release-([0-9]+)\.([0-9]+)$ ]]; then
+          if [[ "$branch" =~ ^release/([0-9]+)\.([0-9]+)$ ]]; then
             expected_minor="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
             actual_minor=$(echo "$version" | cut -d'-' -f1 | cut -d. -f1-2)
             if [ "$expected_minor" != "$actual_minor" ]; then
@@ -53,7 +53,7 @@ jobs:
               exit 1
             fi
           else
-            echo "::error::Branch '$branch' is not a release branch (expected 'release-X.Y')"
+            echo "::error::Branch '$branch' is not a release branch (expected 'release/X.Y')"
             exit 1
           fi
 
@@ -173,14 +173,14 @@ jobs:
           prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
           files: artifacts/*
           fail_on_unmatched_files: true
-      - name: Create dev-X.Y staging branch for this line
+      - name: Create dev/X.Y staging branch for this line
         env:
-          DEV: dev-${{ needs.version.outputs.minor }}
+          DEV: dev/${{ needs.version.outputs.minor }}
           PRERELEASE: ${{ needs.version.outputs.prerelease }}
         run: |
           set -euo pipefail
-          # The dev-X.Y staging branch is seeded from the first *stable* release of
-          # the line, so it never lags behind release-X.Y at a prerelease commit.
+          # The dev/X.Y staging branch is seeded from the first *stable* release of
+          # the line, so it never lags behind release/X.Y at a prerelease commit.
           if [ "$PRERELEASE" = "true" ]; then
             echo "::notice::${{ needs.version.outputs.tag }} is a prerelease — $DEV is created on the first stable release, skipping"
             exit 0
