@@ -2,6 +2,7 @@ import inspect
 import logging
 import os
 import queue
+import re
 import threading
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
@@ -33,8 +34,22 @@ class _Config(BaseModel):
         return logging._nameToLevel[self.log_level.upper()]
 
 
+def _strip_json_comments(text: str) -> str:
+    """Strip // line and /* */ block comments from JSON text so config.json can
+    be commented like JSONC. Comment sequences inside string values (e.g. a
+    "http://..." URL) are preserved: string literals are matched first and kept."""
+    return re.sub(
+        r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/',
+        lambda m: m.group(0) if m.group(0).startswith('"') else "",
+        text,
+        flags=re.DOTALL,
+    )
+
+
 _log_level = (
-    _Config.model_validate_json(Path("config.json").read_text()).get_log_level_value()
+    _Config.model_validate_json(
+        _strip_json_comments(Path("config.json").read_text())
+    ).get_log_level_value()
     if os.path.isfile("config.json")
     else _Config().get_log_level_value()
 )

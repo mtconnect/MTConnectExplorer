@@ -18,11 +18,10 @@ from src.client import (
 )
 from src.pages.core import (
     GlobalState,
-    agent_url,
     get_explore_state,
     get_global_state,
-    get_play_state,
     get_state_lock,
+    running_agent_urls,
 )
 
 _log = logging.getLogger(__name__)
@@ -112,6 +111,12 @@ _TREE_FIX_JS = """<script>
 </script>"""
 
 _HIST_UNITS = ["seconds", "minutes", "hours", "days"]
+
+# Cap on points drawn per chart. A high-rate DataItem over a long window can hold
+# far more samples than are worth rendering (and Altair errors past ~5000 rows),
+# so history is decimated to this many points for display; the X domain still
+# spans the full window, so the plot looks filled.
+_MAX_PLOT_POINTS = 2000
 
 
 def _fmt_local_ts(ts_str: str) -> str:
@@ -245,6 +250,13 @@ def _render_history(
         if not pairs:
             st.caption("No numeric data in history.")
             return
+        if len(pairs) > _MAX_PLOT_POINTS:
+            # Uniform decimation, always keeping the most recent sample.
+            stride = -(-len(pairs) // _MAX_PLOT_POINTS)  # ceil division
+            sampled = pairs[::stride]
+            if sampled[-1] is not pairs[-1]:
+                sampled.append(pairs[-1])
+            pairs = sampled
         ts_list, val_list = zip(*pairs)
         df = pd.DataFrame({"timestamp": list(ts_list), "value": list(val_list)})
         # Vega-Lite converts UTC timestamps to browser local time for display,
@@ -295,8 +307,9 @@ def explore_page() -> None:
         # selectbox only commits typed text on enter/click and discarded it on
         # tab, snapping back to the first option.) Currently-playing local agents
         # are offered as one-click quick-fills below.
-        play_state = get_play_state()
-        playing_urls = [agent_url(s.config.agent_port) for s in play_state.sessions.values()]
+        # Quick-fill suggestions: all currently-running local agents (Play +
+        # Simulator sessions), matching the Capture page.
+        playing_urls = running_agent_urls()
         default_url = GlobalState.model_fields["base_url"].default
         if "exp_base_url" not in st.session_state:
             st.session_state["exp_base_url"] = global_state.base_url or default_url
@@ -552,6 +565,16 @@ def explore_page() -> None:
         if state.running and not explorer.is_alive:
             st.rerun(scope="app")
             return
+        # Retain enough history to fill the largest configured plot duration
+        # (history or pinned-plot window); the explorer caps it at 100,000
+        # samples per DataItem. (hasattr guards an explorer instance from before
+        # this method existed — a session started across a code reload; it takes
+        # full effect once Explore is stopped and restarted.)
+        if hasattr(explorer, "set_history_window"):
+            explorer.set_history_window(max(
+                timedelta(**{state.hist_window_unit: state.hist_window_val}),
+                timedelta(**{state.pin_window_unit: state.pin_window_val}),
+            ))
         _, live_obs = explorer.get_state()
         node = id_to_node.get(state.selected_id)
         if node is None:

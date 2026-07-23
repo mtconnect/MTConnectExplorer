@@ -19,7 +19,7 @@ jobs:
       prerelease: ${{ steps.derive.outputs.prerelease }}
       should_release: ${{ steps.derive.outputs.should_release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: derive
@@ -96,18 +96,21 @@ jobs:
     env:
       ARCHIVE: MTConnectExplorer-v${{ needs.version.outputs.version }}-linux-x86_64.tar.gz
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Build with make
         run: make
+      - name: Generate third-party notices
+        run: venv/bin/python generate_notices.py THIRD_PARTY_NOTICES.txt
       - name: Package tar.gz
         run: |
           test -f dist/MTConnectExplorer
           chmod +x dist/MTConnectExplorer
-          tar -czvf "$ARCHIVE" -C dist MTConnectExplorer
-      - uses: actions/upload-artifact@v4
+          cp THIRD_PARTY_NOTICES.txt dist/
+          tar -czvf "$ARCHIVE" -C dist MTConnectExplorer THIRD_PARTY_NOTICES.txt
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: ${{ env.ARCHIVE }}
@@ -120,21 +123,25 @@ jobs:
     env:
       ARCHIVE: MTConnectExplorer-v${{ needs.version.outputs.version }}-win64.zip
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Build with build.bat
         shell: cmd
         run: build.bat ci
+      - name: Generate third-party notices
+        shell: cmd
+        run: venv\Scripts\python.exe generate_notices.py THIRD_PARTY_NOTICES.txt
       - name: Package zip
         shell: pwsh
         run: |
           if (-not (Test-Path dist\MTConnectExplorer.exe)) {
             throw "dist\MTConnectExplorer.exe not found"
           }
-          Compress-Archive -Path dist\MTConnectExplorer.exe -DestinationPath "$env:ARCHIVE" -Force
-      - uses: actions/upload-artifact@v4
+          Copy-Item THIRD_PARTY_NOTICES.txt dist\
+          Compress-Archive -Path dist\MTConnectExplorer.exe, dist\THIRD_PARTY_NOTICES.txt -DestinationPath "$env:ARCHIVE" -Force
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: ${{ env.ARCHIVE }}
@@ -145,8 +152,8 @@ jobs:
     if: needs.version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -166,7 +173,7 @@ jobs:
             git push origin "$TAG"
           fi
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           name: ${{ needs.version.outputs.tag }}
