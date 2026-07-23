@@ -484,6 +484,7 @@ class MtConnectDatasetPlayer:
 
                 pass_frame_start: Optional[datetime] = None
                 pass_last_offset = timedelta(0)
+                prev_frame_timestamp: Optional[datetime] = None
 
                 while not reader.is_finished:
                     if self._stop_event.is_set():
@@ -495,10 +496,19 @@ class MtConnectDatasetPlayer:
                         pass_frame_start = frame_timestamp
                     frame_offset = frame_timestamp - pass_frame_start
 
-                    # If there is a lot of time between frames, there is likely an issue with the data.
-                    max_frame_delta_minutes = 10
-                    if frame_offset.total_seconds() > (max_frame_delta_minutes * 60):
-                        raise Exception(f"frame_delta '{frame_offset}' is greater than the maximum of '{max_frame_delta_minutes}' minutes.")
+                    # Guard against an absurd GAP between consecutive frames (which
+                    # would otherwise stall paced playback for that long and usually
+                    # signals corrupt/misordered data) — NOT the dataset's total
+                    # length, which is unbounded.
+                    max_gap_minutes = 10
+                    if prev_frame_timestamp is not None:
+                        gap = frame_timestamp - prev_frame_timestamp
+                        if gap.total_seconds() > (max_gap_minutes * 60):
+                            raise Exception(
+                                f"gap between consecutive frames '{gap}' exceeds the maximum "
+                                f"of '{max_gap_minutes}' minutes; the dataset may be corrupt or misordered."
+                            )
+                    prev_frame_timestamp = frame_timestamp
 
                     total_delta = elapsed_offset + frame_offset
 

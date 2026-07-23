@@ -42,9 +42,9 @@ def _rename_dialog(filename: str) -> None:
     st.caption(f"New filename: {new_stem}{_EXT}" if new_stem else "Enter a name.")
 
     c1, c2 = st.columns(2)
-    cancel = c1.button("Cancel", use_container_width=True, key=f"ds_rename_cancel_{filename}")
+    cancel = c1.button("Cancel", width="stretch", key=f"ds_rename_cancel_{filename}")
     rename = c2.button(
-        "Rename", type="primary", use_container_width=True, key=f"ds_rename_confirm_{filename}",
+        "Rename", type="primary", width="stretch", key=f"ds_rename_confirm_{filename}",
     )
 
     if cancel:

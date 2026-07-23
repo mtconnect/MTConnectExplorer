@@ -22,9 +22,9 @@ from src.pages.core import (
     drain,
     get_capture_state,
     get_global_state,
-    get_play_state,
     get_state_lock,
     log_area,
+    running_agent_urls,
     session_thread_name,
 )
 
@@ -118,7 +118,7 @@ def capture_page() -> None:
             head_l, head_r = st.columns([3, 1])
             head_l.subheader("Capturing")
             with head_r:
-                if st.button("Stop All", use_container_width=True):
+                if st.button("Stop All", width="stretch"):
                     with get_state_lock():
                         for sid in list(state.sessions):
                             _remove_session(state, sid)
@@ -138,7 +138,7 @@ def capture_page() -> None:
                 alive = sess.collector is not None and sess.collector.is_alive
                 c[3].write("capturing" if alive else "stopping")
                 with c[4]:
-                    if st.button("Stop", key=f"cap_stop_{sid}", use_container_width=True):
+                    if st.button("Stop", key=f"cap_stop_{sid}", width="stretch"):
                         with get_state_lock():
                             _remove_session(state, sid)
                         st.rerun()
@@ -148,30 +148,46 @@ def capture_page() -> None:
     _, form_col, _ = form_container.columns([1, 2, 1])
     with form_col:
         st.subheader("Start Capture")
-        # Editable dropdown: free-text URL. The default demo URL is always first
-        # and the default selection; only currently-playing agents follow as
-        # quick options (so stopped playbacks don't linger in the list).
-        play_state = get_play_state()
-        playing_urls = [agent_url(s.config.agent_port) for s in play_state.sessions.values()]
+        # Base URL is a plain text field so a manually typed value is kept exactly
+        # as entered — tab, enter, or clicking Start all commit it. Currently-
+        # running local agents (Play and Simulator sessions) are offered as
+        # one-click quick-fills below.
+        playing_urls = running_agent_urls()
         default_url = GlobalState.model_fields["base_url"].default
-        base_url_options: list = []
-        for u in [default_url, *playing_urls]:
-            if u and u not in base_url_options:
-                base_url_options.append(u)
-        base_url = st.selectbox(
+        if "cap_base_url" not in st.session_state:
+            st.session_state["cap_base_url"] = global_state.base_url or default_url
+
+        def _use_base_url(url: str) -> None:
+            st.session_state["cap_base_url"] = url
+
+        base_url = st.text_input(
             "Base URL",
-            base_url_options,
-            index=0,
-            accept_new_options=True,
-            key="cap_base_url_select",
+            key="cap_base_url",
+            placeholder=default_url,
         )
+        # Quick-fill buttons for the demo server and any currently-running local
+        # agents, one per column in a single row right under the field; clicking
+        # one populates the Base URL field above.
+        quick_urls = [u for u in dict.fromkeys([default_url, *playing_urls]) if u]
+        if quick_urls:
+            qcols = st.columns(len(quick_urls))
+            for i, u in enumerate(quick_urls):
+                qcols[i].button(u, key=f"cap_url_quick_{i}", width="stretch",
+                                on_click=_use_base_url, args=(u,))
+        # Interval default depends on the target. The public demo server is
+        # shared, so it defaults to a courteous 1000 ms and is floored there for
+        # every mode (you can set a higher interval, never a lower one) to avoid
+        # accidentally hammering it. Any other agent (typically a local one) can
+        # be polled far faster, so the default depends on the mode; that value is
+        # only a starting point and the user can override it.
+        _MODE_DEFAULT_INTERVAL_MS = {"stream": 10, "sample": 50, "current": 200}
+        _DEMO_MIN_INTERVAL_MS = 1000
+        demo_url = default_url.strip().rstrip("/")
+        is_demo = str(base_url).strip().rstrip("/") == demo_url
+
         c1, c2 = st.columns(2)
+        # Mode (left) is created first: the interval default reads its value.
         with c1:
-            stream_interval_ms = st.number_input(
-                "Interval (ms)", value=config.interval_ms, min_value=1, step=1,
-                key="cap_stream_interval_ms",
-            )
-        with c2:
             _modes = ["stream", "sample", "current"]
             mode = st.selectbox(
                 "Mode", _modes,
@@ -179,10 +195,27 @@ def capture_page() -> None:
                 key="cap_mode",
                 filter_mode=None,  # Disable search/text input
             )
+        with c2:
+            # The key varies with target/mode so switching either re-seeds the
+            # default — Streamlit ignores `value` once a keyed widget has state.
+            if is_demo:
+                interval_value = interval_min = _DEMO_MIN_INTERVAL_MS
+                interval_key = "cap_interval_demo"
+            else:
+                interval_value = _MODE_DEFAULT_INTERVAL_MS.get(mode, 10)
+                interval_min = 1
+                interval_key = f"cap_interval_{mode}"
+            stream_interval_ms = st.number_input(
+                "Interval (ms)", value=interval_value, min_value=interval_min, step=1,
+                key=interval_key,
+                help=("The public demo server is shared: 1000 ms is the minimum "
+                      "(you can set a higher interval) to avoid overloading it."
+                      if is_demo else None),
+            )
 
         start_clicked = st.button(
             "Start", disabled=not str(base_url).strip(),
-            use_container_width=True, type="primary",
+            width="stretch", type="primary",
         )
 
         if start_clicked and str(base_url).strip():
