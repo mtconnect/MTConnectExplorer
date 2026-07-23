@@ -7,11 +7,15 @@ through the same pipeline (``ShdrAdapter`` -> bundled ``agent.exe`` -> HTTP):
 
     generated <Device> XML + routine values -> ShdrAdapter -> Agent -> HTTP
 
-Two pieces of equipment are supported:
+Three pieces of equipment are supported:
 
   * ``MILL_3AXIS``  — a 3-axis vertical mill (X/Y/Z, each 0..1000 mm) running a
     canned program: trace the stock bounding box, a facing raster, then a
     circular boring pattern (stepping deeper in Z). Loops.
+  * ``MILL_5AXIS_TRUNNION``  — a 5-axis trunnion mill: the head carries X/Y/Z while the
+    table tilts about Y (B1) and rotates about Z (C1). Its canned program runs a
+    set of 3+2 indexed facing passes followed by a simultaneous 5-axis contour
+    (a helical wrap around the part). Loops.
   * ``ROBOT_6DOF``  — a generic 6-DOF articulated robot running a pick-and-place
     cycle defined in joint space. Loops.
 
@@ -46,12 +50,14 @@ logger = logging.getLogger(__name__)
 # ===========================================================================
 class EquipmentType(str, Enum):
     MILL_3AXIS = "MILL_3AXIS"
+    MILL_5AXIS_TRUNNION = "MILL_5AXIS_TRUNNION"
     ROBOT_6DOF = "ROBOT_6DOF"
 
     @property
     def label(self) -> str:
         return {
             EquipmentType.MILL_3AXIS: "3-Axis Mill",
+            EquipmentType.MILL_5AXIS_TRUNNION: "5-Axis Trunnion Mill (B/C)",
             EquipmentType.ROBOT_6DOF: "6-DOF Robot",
         }[self]
 
@@ -59,6 +65,7 @@ class EquipmentType(str, Enum):
     def default_device_name(self) -> str:
         return {
             EquipmentType.MILL_3AXIS: "Mill",
+            EquipmentType.MILL_5AXIS_TRUNNION: "TrunnionMill",
             EquipmentType.ROBOT_6DOF: "Robot",
         }[self]
 
@@ -67,6 +74,7 @@ class EquipmentType(str, Enum):
         """Human label for the (single, for now) canned routine of this type."""
         return {
             EquipmentType.MILL_3AXIS: "Canned G-Code Routine",
+            EquipmentType.MILL_5AXIS_TRUNNION: "Canned 3+2 & Simultaneous Routine",
             EquipmentType.ROBOT_6DOF: "Canned Pick-and-Place",
         }[self]
 
@@ -250,6 +258,85 @@ def build_mill_device_model(device_name: str, uuid: str) -> str:
     """).strip()
 
 
+def build_mill5_device_model(device_name: str, uuid: str) -> str:
+    # 5-axis trunnion mill. The three linear axes (X/Y/Z) ride on the head; the
+    # two rotary positioning axes are B1 (tilts the table about Y) and C1 (rotates
+    # the table about Z). The tool-driving spindle is a separate Rotary named "S"
+    # (ROTARY_MODE=SPINDLE) so it does not collide with the C1 positioning axis —
+    # the 3-axis model reuses "C1" for its spindle, but here C1 is the C axis.
+    return dedent(f"""
+    <Device uuid="{uuid}" name="{device_name}" id="{uuid}">
+      <Description model="5-Axis VMC" manufacturer="Generic">Simulated 5-axis vertical machining center (trunnion B/C)</Description>
+      <DataItems>
+        <DataItem id="avail" category="EVENT" type="AVAILABILITY"   name="avail"/>
+        <DataItem id="estop" category="EVENT" type="EMERGENCY_STOP" name="estop"/>
+      </DataItems>
+      <Components>
+        <Axes id="axes" name="Axes">
+          <Components>
+            <Linear id="x" name="X">
+              <DataItems>
+                <DataItem id="Xact"  category="SAMPLE" type="POSITION" subType="ACTUAL" name="Xact"  units="MILLIMETER" nativeUnits="MILLIMETER"/>
+                <DataItem id="Xload" category="SAMPLE" type="LOAD"                      name="Xload" units="PERCENT"    nativeUnits="PERCENT"/>
+              </DataItems>
+            </Linear>
+            <Linear id="y" name="Y">
+              <DataItems>
+                <DataItem id="Yact"  category="SAMPLE" type="POSITION" subType="ACTUAL" name="Yact"  units="MILLIMETER" nativeUnits="MILLIMETER"/>
+                <DataItem id="Yload" category="SAMPLE" type="LOAD"                      name="Yload" units="PERCENT"    nativeUnits="PERCENT"/>
+              </DataItems>
+            </Linear>
+            <Linear id="z" name="Z">
+              <DataItems>
+                <DataItem id="Zact"  category="SAMPLE" type="POSITION" subType="ACTUAL" name="Zact"  units="MILLIMETER" nativeUnits="MILLIMETER"/>
+                <DataItem id="Zload" category="SAMPLE" type="LOAD"                      name="Zload" units="PERCENT"    nativeUnits="PERCENT"/>
+              </DataItems>
+            </Linear>
+            <Rotary id="b1" name="B1">
+              <DataItems>
+                <DataItem id="Bact"  category="SAMPLE" type="ANGLE" subType="ACTUAL" name="Bact"  units="DEGREE"  nativeUnits="DEGREE"/>
+                <DataItem id="Bload" category="SAMPLE" type="LOAD"                   name="Bload" units="PERCENT" nativeUnits="PERCENT"/>
+                <DataItem id="Bmode" category="EVENT"  type="ROTARY_MODE"            name="Bmode"/>
+              </DataItems>
+            </Rotary>
+            <Rotary id="c1" name="C1">
+              <DataItems>
+                <DataItem id="Cact"  category="SAMPLE" type="ANGLE" subType="ACTUAL" name="Cact"  units="DEGREE"  nativeUnits="DEGREE"/>
+                <DataItem id="Cload" category="SAMPLE" type="LOAD"                   name="Cload" units="PERCENT" nativeUnits="PERCENT"/>
+                <DataItem id="Cmode" category="EVENT"  type="ROTARY_MODE"            name="Cmode"/>
+              </DataItems>
+            </Rotary>
+            <Rotary id="s" name="S">
+              <DataItems>
+                <DataItem id="Sspeed" category="SAMPLE" type="ROTARY_VELOCITY" subType="ACTUAL" name="Sspeed" units="REVOLUTION/MINUTE" nativeUnits="REVOLUTION/MINUTE"/>
+                <DataItem id="Sload"  category="SAMPLE" type="LOAD"                             name="Sload"  units="PERCENT"           nativeUnits="PERCENT"/>
+                <DataItem id="Smode"  category="EVENT"  type="ROTARY_MODE"                      name="Smode">
+                  <Constraints><Value>SPINDLE</Value></Constraints>
+                </DataItem>
+              </DataItems>
+            </Rotary>
+          </Components>
+        </Axes>
+        <Controller id="ctrl" name="Controller">
+          <DataItems>
+            <DataItem id="cmode" category="EVENT" type="CONTROLLER_MODE" name="cmode"/>
+            <DataItem id="exec"  category="EVENT" type="EXECUTION"       name="exec"/>
+            <DataItem id="prog"  category="EVENT" type="PROGRAM" name="prog"/>
+          </DataItems>
+          <Components>
+            <Path id="path" name="path">
+              <DataItems>
+                <DataItem id="Fact"    category="SAMPLE" type="PATH_FEEDRATE" subType="ACTUAL" name="Fact"    units="MILLIMETER/SECOND" nativeUnits="MILLIMETER/SECOND"/>
+                <DataItem id="pathpos" category="SAMPLE" type="PATH_POSITION" subType="ACTUAL" name="pathpos" units="MILLIMETER_3D"      nativeUnits="MILLIMETER_3D"/>
+              </DataItems>
+            </Path>
+          </Components>
+        </Controller>
+      </Components>
+    </Device>
+    """).strip()
+
+
 def build_robot_device_model(device_name: str, uuid: str) -> str:
     # Articulated-robot joints are modeled as Rotary axes named J1..Jn (not the
     # A/B/C of a machine tool), each reporting its angular POSITION via an ANGLE
@@ -400,6 +487,139 @@ def build_mill_routine() -> RoutineSpec:
     return RoutineSpec(EquipmentType.MILL_3AXIS, ("Xact", "Yact", "Zact"), start, moves, geometry)
 
 
+# ---------------------------------------------------------------------------
+# 5-axis trunnion mill. The head carries X/Y/Z (tool tip = commanded X/Y/Z in
+# world/machine coords); the table tilts about Y (B1) then rotates about Z (C1),
+# so the workpiece never translates. The coordinate vector is [X, Y, Z, B1, C1]
+# (mm, mm, mm, deg, deg). The stock is centered on the tilt pivot so B1 rotates
+# it about its own centre. Everything shares the 0..1000 mm envelope.
+# ---------------------------------------------------------------------------
+_M5_LIMIT = 1000.0
+_M5_CX = 500.0                 # part / pivot centre in X
+_M5_CY = 500.0                 # part / pivot centre in Y
+_M5_HALF = 130.0               # stock half-width in X and Y
+_M5_STOCK_H = 200.0            # stock height (Z)
+_M5_PIVOT_Z = 380.0            # trunnion tilt centre (= stock centre Z)
+_M5_Z_BOT = _M5_PIVOT_Z - _M5_STOCK_H / 2.0   # 280 (stock bottom, untilted)
+_M5_Z_TOP = _M5_PIVOT_Z + _M5_STOCK_H / 2.0   # 480 (stock top,    untilted)
+_M5_Z_SAFE = 600.0             # rapid / retract plane (clears the tilted part)
+_M5_LIN_RAPID = 400.0          # mm/s
+_M5_LIN_FEED = 130.0           # mm/s
+_M5_ROT_RAPID = 60.0           # deg/s
+_M5_ROT_FEED = 25.0            # deg/s
+_M5_TOOL_DIA = 50.0
+
+
+def _seg5(moves: List[_Move], target: Tuple[float, float, float, float, float],
+          lin_speed: float, rot_speed: float, meta: Dict[str, Any],
+          prev: List[float]) -> None:
+    """Append a 5-axis move to ``target``, timed by whichever of linear (mm) or
+    rotary (deg) travel takes longer at the given feeds — so a pure reorientation
+    is paced by ``rot_speed`` and a straight cut by ``lin_speed``."""
+    lin = math.dist(prev[0:3], target[0:3])
+    rot = max(abs(target[3] - prev[3]), abs(target[4] - prev[4]))
+    dur = max(lin / lin_speed if lin_speed else 0.0,
+              rot / rot_speed if rot_speed else 0.0, 0.05)
+    m = dict(meta)
+    m["_dur"] = dur
+    m["feed"] = lin_speed if lin > 1e-6 else 0.0
+    moves.append(_Move(target=tuple(float(v) for v in target), duration=dur, meta=m))
+    prev[:] = list(target)
+
+
+def _m5_top_z(b1_deg: float) -> float:
+    """Approximate world-Z of the tilted stock's highest point, used to place a
+    grazing facing cut on the presented face."""
+    b = math.radians(b1_deg)
+    return _M5_PIVOT_Z + _M5_HALF * abs(math.sin(b)) + (_M5_STOCK_H / 2.0) * abs(math.cos(b))
+
+
+def build_mill5_routine() -> RoutineSpec:
+    moves: List[_Move] = []
+    start = (_M5_CX, _M5_CY, _M5_Z_SAFE, 0.0, 0.0)
+    prev = list(start)
+
+    def rapid_meta(prog: str, rmode: str = "INDEX") -> Dict[str, Any]:
+        return {"exec": "ACTIVE", "prog": prog, "spindle": 0.0, "cutting": False, "rmode": rmode}
+
+    def cut_meta(prog: str, rpm: float, rmode: str = "INDEX") -> Dict[str, Any]:
+        return {"exec": "ACTIVE", "prog": prog, "spindle": rpm, "cutting": True, "rmode": rmode}
+
+    # ---- Phase A: 3+2 indexed facing at three orientations (rotaries in INDEX) ----
+    # C1 climbs monotonically (0 -> 120 -> 240) so every reorientation indexes the
+    # short way forward; Phase B then continues forward to a multiple of 360 for a
+    # seamless loop (see the closing note).
+    prog_a = "INDEX_FACE.NC"
+    for (b1, c1) in [(0.0, 0.0), (35.0, 120.0), (35.0, 240.0)]:
+        # Reorient the table over the part at the safe plane (pure index move).
+        _seg5(moves, (_M5_CX, _M5_CY, _M5_Z_SAFE, b1, c1),
+              _M5_LIN_RAPID, _M5_ROT_RAPID, rapid_meta(prog_a), prev)
+        cut_z = _m5_top_z(b1) - 8.0
+        y0, y1 = _M5_CY - 80.0, _M5_CY + 80.0
+        xs = [_M5_CX - 70.0, _M5_CX - 23.0, _M5_CX + 24.0, _M5_CX + 70.0]
+        # Rapid over the first raster line, then plunge to the grazing depth.
+        _seg5(moves, (xs[0], y0, _M5_Z_SAFE, b1, c1),
+              _M5_LIN_RAPID, _M5_ROT_RAPID, rapid_meta(prog_a), prev)
+        _seg5(moves, (xs[0], y0, cut_z, b1, c1),
+              _M5_LIN_FEED, _M5_ROT_FEED, cut_meta(prog_a, 3200.0), prev)
+        # Boustrophedon raster: traverse Y, step over in X (rotaries held).
+        for i, xv in enumerate(xs):
+            y_far = y1 if i % 2 == 0 else y0
+            _seg5(moves, (xv, y_far, cut_z, b1, c1),
+                  _M5_LIN_FEED, _M5_ROT_FEED, cut_meta(prog_a, 3200.0), prev)
+            if i < len(xs) - 1:
+                _seg5(moves, (xs[i + 1], y_far, cut_z, b1, c1),
+                      _M5_LIN_FEED, _M5_ROT_FEED, cut_meta(prog_a, 3200.0), prev)
+        _seg5(moves, (prev[0], prev[1], _M5_Z_SAFE, b1, c1),
+              _M5_LIN_RAPID, _M5_ROT_RAPID, rapid_meta(prog_a), prev)
+
+    # ---- Phase B: simultaneous 5-axis contour (rotaries in CONTOUR) ----
+    # A helical wrap down the side of the part: C1 spins two full turns while Z
+    # ramps down and B1 gently oscillates, so all five axes move together.
+    prog_b = "SIMUL_5X.NC"
+    r = _M5_HALF + 22.0
+    c_start = 360.0                # continue forward from Phase A's 240 -> 360
+    # Reorient to the contour start, then approach the side of the part.
+    _seg5(moves, (_M5_CX, _M5_CY, _M5_Z_SAFE, 20.0, c_start),
+          _M5_LIN_RAPID, _M5_ROT_RAPID, rapid_meta(prog_b, "CONTOUR"), prev)
+    _seg5(moves, (_M5_CX + r, _M5_CY, _M5_Z_TOP - 10.0, 20.0, c_start),
+          _M5_LIN_RAPID, _M5_ROT_RAPID, rapid_meta(prog_b, "CONTOUR"), prev)
+    steps, revs = 96, 2.0
+    # Keep the contour in the upper part of the stock: the head block rides ~90 mm
+    # above the tool tip, so a deeper spiral would drive the head into the tilted
+    # workpiece. z_lo stays high enough that the head clears the part top.
+    z_hi, z_lo = _M5_Z_TOP - 10.0, _M5_Z_TOP - 40.0
+    for k in range(1, steps + 1):
+        frac = k / steps
+        c1 = c_start + 360.0 * revs * frac
+        z = z_hi + (z_lo - z_hi) * frac
+        b1 = 20.0 + 15.0 * math.sin(2.0 * math.pi * 2.0 * frac)   # gentle tilt sweep
+        _seg5(moves, (_M5_CX + r, _M5_CY, z, b1, c1),
+              _M5_LIN_FEED, _M5_ROT_FEED, cut_meta(prog_b, 3600.0, "CONTOUR"), prev)
+    c_end = c_start + 360.0 * revs   # 1080 — a multiple of 360, so it wraps cleanly
+    # Retract, then home. C1 is left at c_end (a multiple of 360): on the cycle
+    # wrap coords() jumps c_end -> start's 0, which is the SAME orientation modulo
+    # 360, so the loop is seamless while every in-cycle index move went forward.
+    _seg5(moves, (_M5_CX + r, _M5_CY, _M5_Z_SAFE, 20.0, c_end),
+          _M5_LIN_RAPID, _M5_ROT_RAPID, rapid_meta(prog_b, "CONTOUR"), prev)
+    _seg5(moves, (_M5_CX, _M5_CY, _M5_Z_SAFE, 0.0, c_end),
+          _M5_LIN_RAPID, _M5_ROT_RAPID, rapid_meta(prog_b), prev)
+
+    geometry = {
+        "limit": _M5_LIMIT,
+        "tool_dia": _M5_TOOL_DIA,
+        "half": _M5_HALF,
+        "stock_h": _M5_STOCK_H,
+        "pivot": [_M5_CX, _M5_CY, _M5_PIVOT_Z],
+        "work": {"x0": _M5_CX - _M5_HALF, "x1": _M5_CX + _M5_HALF,
+                 "y0": _M5_CY - _M5_HALF, "y1": _M5_CY + _M5_HALF,
+                 "z_bot": _M5_Z_BOT, "z_top": _M5_Z_TOP, "z_safe": _M5_Z_SAFE},
+    }
+    return RoutineSpec(EquipmentType.MILL_5AXIS_TRUNNION,
+                       ("Xact", "Yact", "Zact", "Bact", "Cact"),
+                       start, moves, geometry)
+
+
 # Robot pick-and-place, joint-space waypoints (degrees) [J1..J6].
 #
 # Every pick/place-column pose keeps the end effector pointing STRAIGHT DOWN by
@@ -445,6 +665,8 @@ def build_robot_routine() -> RoutineSpec:
 def build_routine(equipment: EquipmentType) -> RoutineSpec:
     if equipment == EquipmentType.MILL_3AXIS:
         return build_mill_routine()
+    if equipment == EquipmentType.MILL_5AXIS_TRUNNION:
+        return build_mill5_routine()
     return build_robot_routine()
 
 
@@ -489,6 +711,8 @@ class EquipmentSimulator:
         uuid = f"{device_name}.sim"
         if equipment == EquipmentType.MILL_3AXIS:
             device_model = build_mill_device_model(device_name, uuid)
+        elif equipment == EquipmentType.MILL_5AXIS_TRUNNION:
+            device_model = build_mill5_device_model(device_name, uuid)
         else:
             device_model = build_robot_device_model(device_name, uuid)
 
@@ -565,7 +789,7 @@ class EquipmentSimulator:
             now = datetime.now(timezone.utc)
             for name, value in (("avail", "AVAILABLE"), ("estop", "ARMED"), ("cmode", "AUTOMATIC")):
                 self._enqueue_changed(name, value, now)
-            if self._equipment == EquipmentType.MILL_3AXIS:
+            if self._equipment in (EquipmentType.MILL_3AXIS, EquipmentType.MILL_5AXIS_TRUNNION):
                 self._enqueue_changed("Smode", "SPINDLE", now)
 
             cycle = self._spec.cycle_time
@@ -574,6 +798,8 @@ class EquipmentSimulator:
                 ts = datetime.now(timezone.utc)
                 if self._equipment == EquipmentType.MILL_3AXIS:
                     self._emit_mill(phase, ts)
+                elif self._equipment == EquipmentType.MILL_5AXIS_TRUNNION:
+                    self._emit_mill5(phase, ts)
                 else:
                     self._emit_robot(phase, ts)
                 time.sleep(self._tick_s)
@@ -596,6 +822,32 @@ class EquipmentSimulator:
         self._enqueue_changed("Zload", round(min(100.0, base + 0.40 * abs(vel[2])), 1), ts)
         self._enqueue_changed("Sspeed", round(meta.get("spindle", 0.0), 1), ts)
         self._enqueue_changed("Sload", round(45.0 if cutting else 5.0, 1), ts)
+        self._enqueue_changed("Fact", round(meta.get("feed", 0.0), 1), ts)
+        self._enqueue_changed("pathpos", f"{round(x, 2)} {round(y, 2)} {round(z, 2)}", ts)
+        if meta.get("prog"):
+            self._enqueue_changed("prog", meta["prog"], ts)
+        if meta.get("exec"):
+            self._enqueue_changed("exec", meta["exec"], ts)
+
+    def _emit_mill5(self, phase: float, ts: datetime) -> None:
+        (x, y, z, b1, c1), vel, meta = self._spec.coords(phase)
+        self._enqueue_changed("Xact", round(x, 2), ts)
+        self._enqueue_changed("Yact", round(y, 2), ts)
+        self._enqueue_changed("Zact", round(z, 2), ts)
+        self._enqueue_changed("Bact", round(b1, 3), ts)
+        self._enqueue_changed("Cact", round(c1, 3), ts)
+        cutting = bool(meta.get("cutting"))
+        base = 30.0 if cutting else 3.0
+        self._enqueue_changed("Xload", round(min(100.0, base + 0.25 * abs(vel[0])), 1), ts)
+        self._enqueue_changed("Yload", round(min(100.0, base + 0.25 * abs(vel[1])), 1), ts)
+        self._enqueue_changed("Zload", round(min(100.0, base + 0.40 * abs(vel[2])), 1), ts)
+        self._enqueue_changed("Bload", round(min(100.0, 2.0 + 0.5 * abs(vel[3])), 1), ts)
+        self._enqueue_changed("Cload", round(min(100.0, 2.0 + 0.3 * abs(vel[4])), 1), ts)
+        self._enqueue_changed("Sspeed", round(meta.get("spindle", 0.0), 1), ts)
+        self._enqueue_changed("Sload", round(45.0 if cutting else 5.0, 1), ts)
+        rmode = meta.get("rmode", "INDEX")
+        self._enqueue_changed("Bmode", rmode, ts)
+        self._enqueue_changed("Cmode", rmode, ts)
         self._enqueue_changed("Fact", round(meta.get("feed", 0.0), 1), ts)
         self._enqueue_changed("pathpos", f"{round(x, 2)} {round(y, 2)} {round(z, 2)}", ts)
         if meta.get("prog"):

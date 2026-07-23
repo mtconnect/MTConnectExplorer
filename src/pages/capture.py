@@ -118,7 +118,7 @@ def capture_page() -> None:
             head_l, head_r = st.columns([3, 1])
             head_l.subheader("Capturing")
             with head_r:
-                if st.button("Stop All", use_container_width=True):
+                if st.button("Stop All", width="stretch"):
                     with get_state_lock():
                         for sid in list(state.sessions):
                             _remove_session(state, sid)
@@ -138,7 +138,7 @@ def capture_page() -> None:
                 alive = sess.collector is not None and sess.collector.is_alive
                 c[3].write("capturing" if alive else "stopping")
                 with c[4]:
-                    if st.button("Stop", key=f"cap_stop_{sid}", use_container_width=True):
+                    if st.button("Stop", key=f"cap_stop_{sid}", width="stretch"):
                         with get_state_lock():
                             _remove_session(state, sid)
                         st.rerun()
@@ -148,23 +148,32 @@ def capture_page() -> None:
     _, form_col, _ = form_container.columns([1, 2, 1])
     with form_col:
         st.subheader("Start Capture")
-        # Editable dropdown: free-text URL. The default demo URL is always first
-        # and the default selection; currently-running local agents (Play and
-        # Simulator sessions) follow as quick options (so stopped sessions don't
-        # linger in the list).
+        # Base URL is a plain text field so a manually typed value is kept exactly
+        # as entered — tab, enter, or clicking Start all commit it. Currently-
+        # running local agents (Play and Simulator sessions) are offered as
+        # one-click quick-fills below.
         playing_urls = running_agent_urls()
         default_url = GlobalState.model_fields["base_url"].default
-        base_url_options: list = []
-        for u in [default_url, *playing_urls]:
-            if u and u not in base_url_options:
-                base_url_options.append(u)
-        base_url = st.selectbox(
+        if "cap_base_url" not in st.session_state:
+            st.session_state["cap_base_url"] = global_state.base_url or default_url
+
+        def _use_base_url(url: str) -> None:
+            st.session_state["cap_base_url"] = url
+
+        base_url = st.text_input(
             "Base URL",
-            base_url_options,
-            index=0,
-            accept_new_options=True,
-            key="cap_base_url_select",
+            key="cap_base_url",
+            placeholder=default_url,
         )
+        # Quick-fill buttons for the demo server and any currently-running local
+        # agents, one per column in a single row right under the field; clicking
+        # one populates the Base URL field above.
+        quick_urls = [u for u in dict.fromkeys([default_url, *playing_urls]) if u]
+        if quick_urls:
+            qcols = st.columns(len(quick_urls))
+            for i, u in enumerate(quick_urls):
+                qcols[i].button(u, key=f"cap_url_quick_{i}", width="stretch",
+                                on_click=_use_base_url, args=(u,))
         # Interval default depends on the target. The public demo server is
         # shared, so it defaults to a courteous 1000 ms and is floored there for
         # every mode (you can set a higher interval, never a lower one) to avoid
@@ -206,7 +215,7 @@ def capture_page() -> None:
 
         start_clicked = st.button(
             "Start", disabled=not str(base_url).strip(),
-            use_container_width=True, type="primary",
+            width="stretch", type="primary",
         )
 
         if start_clicked and str(base_url).strip():

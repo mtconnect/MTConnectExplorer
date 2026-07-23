@@ -290,69 +290,81 @@ def explore_page() -> None:
     config_col = st.columns([1, 2, 1])[1]
     with config_col:
         st.subheader("Configuration")
-        # Editable dropdown: free-text URL. The default demo URL is always first and
-        # the default selection; only currently-playing agents follow as quick
-        # options (so stopped playbacks don't linger in the list).
+        # Base URL is a plain text field so a manually typed value is kept exactly
+        # as entered — tab, enter, or clicking Start all commit it. (An editable
+        # selectbox only commits typed text on enter/click and discarded it on
+        # tab, snapping back to the first option.) Currently-playing local agents
+        # are offered as one-click quick-fills below.
         play_state = get_play_state()
         playing_urls = [agent_url(s.config.agent_port) for s in play_state.sessions.values()]
         default_url = GlobalState.model_fields["base_url"].default
-        base_url_options: list = []
-        for u in [default_url, *playing_urls]:
-            if u and u not in base_url_options:
-                base_url_options.append(u)
-        base_url = st.selectbox(
+        if "exp_base_url" not in st.session_state:
+            st.session_state["exp_base_url"] = global_state.base_url or default_url
+
+        def _use_base_url(url: str) -> None:
+            st.session_state["exp_base_url"] = url
+
+        base_url = st.text_input(
             "Base URL",
-            base_url_options,
-            index=0,
-            accept_new_options=True,
-            key="exp_base_url_select",
+            key="exp_base_url",
             disabled=disabled,
+            placeholder=default_url,
         )
-        # Demo server: floor the interval at 1000 ms (default 1000, higher
-        # allowed) to avoid overloading the shared public server. Any other agent
-        # keeps the plain 1000 ms default for every mode but can be set as low as
-        # 1 ms.
+        # Quick-fill buttons for the demo server and any currently-playing local
+        # agents, one per column in a single row right under the field; clicking
+        # one populates the Base URL field above.
+        quick_urls = [u for u in dict.fromkeys([default_url, *playing_urls]) if u]
+        if quick_urls and not disabled:
+            qcols = st.columns(len(quick_urls))
+            for i, u in enumerate(quick_urls):
+                qcols[i].button(u, key=f"exp_url_quick_{i}", width="stretch",
+                                on_click=_use_base_url, args=(u,))
+        # Interval default depends on the target and mode and updates as either
+        # changes (a manual edit is remembered per target+mode). The shared public
+        # demo server is floored at 1000 ms (raise it, never lower) to avoid
+        # hammering it; a local agent can be polled far faster, so its default
+        # follows the mode.
+        _MODE_DEFAULT_INTERVAL_MS = {"stream": 10, "sample": 50, "current": 200}
         _DEMO_MIN_INTERVAL_MS = 1000
         demo_url = default_url.strip().rstrip("/")
         is_demo = str(base_url).strip().rstrip("/") == demo_url
 
         col1, col2 = st.columns(2)
-        with col2:
-            # The key varies with the target so switching to/from the demo server
-            # re-seeds the default — Streamlit ignores `value` (and would error on
-            # a value below a raised min_value) once a keyed widget has state.
-            if is_demo:
-                interval_min = _DEMO_MIN_INTERVAL_MS
-                interval_value = max(int(state.cfg_interval_ms), _DEMO_MIN_INTERVAL_MS)
-                interval_key = "exp_interval_demo"
-            else:
-                interval_min = 1
-                interval_value = int(state.cfg_interval_ms)
-                interval_key = "exp_interval_other"
-            interval_ms = st.number_input(
-                "Interval (ms)", value=interval_value,
-                min_value=interval_min, step=1, key=interval_key, disabled=disabled,
-                help=("The public demo server is shared: 1000 ms is the minimum "
-                      "(you can set a higher interval) to avoid overloading it."
-                      if is_demo else None),
-            )
+        # Mode (left) is created first so the interval default can read it.
         with col1:
             _modes = ["stream", "sample", "current"]
             mode = st.selectbox(
                 "Mode", _modes,
-                index=_modes.index(state.cfg_mode),
+                index=_modes.index(state.cfg_mode) if state.cfg_mode in _modes else 0,
                 key="exp_input_mode", disabled=disabled,
                 filter_mode=None,
+            )
+        with col2:
+            # The key encodes target+mode so switching either re-seeds the default;
+            # Streamlit ignores `value` once a keyed widget has state.
+            if is_demo:
+                interval_value = interval_min = _DEMO_MIN_INTERVAL_MS
+                interval_key = "exp_interval_demo"
+            else:
+                interval_value = _MODE_DEFAULT_INTERVAL_MS.get(mode, 10)
+                interval_min = 1
+                interval_key = f"exp_interval_{mode}"
+            interval_ms = st.number_input(
+                "Interval (ms)", value=interval_value, min_value=interval_min, step=1,
+                key=interval_key, disabled=disabled,
+                help=("The public demo server is shared: 1000 ms is the minimum "
+                      "(you can set a higher interval) to avoid overloading it."
+                      if is_demo else None),
             )
 
         col1, col2 = st.columns(2)
         with col1:
             start_clicked = st.button(
-                "Start", disabled=disabled, use_container_width=True, type="primary",
+                "Start", disabled=disabled, width="stretch", type="primary",
             )
         with col2:
             stop_clicked = st.button(
-                "Stop", disabled=not disabled, use_container_width=True,
+                "Stop", disabled=not disabled, width="stretch",
             )
 
     if start_clicked:
@@ -404,7 +416,9 @@ def explore_page() -> None:
                 st.info("Configure the connection above and click **Start** to explore the MTConnect agent.")
         return
 
-    probe_devices, observations = explorer.get_state()
+    # Only the probe (static device model) is needed here; the live fragments
+    # below fetch fresh observations themselves each tick.
+    probe_devices, _ = explorer.get_state()
 
     if not probe_devices:
         st.info("Waiting for probe response…")
@@ -518,34 +532,57 @@ def explore_page() -> None:
 
         state.expanded = new_expanded
 
-    # ---- Detail column ----
-    with detail_col:
+    # Live regions (current value, history, pinned plots) refresh on their own
+    # timers via st.fragment rather than a full-page rerun. This is the key
+    # performance change: the tree column above has no live data, so it renders
+    # only on interaction and its heavy tree_select component is NOT re-rendered
+    # each tick — only the value/plot elements below re-render every 0.5s, so
+    # reload cost no longer scales with re-rendering the whole page.
+    refresh = 0.5 if state.running else None
+    # Pinned plots additionally honor an Auto-Refresh toggle so the user can
+    # freeze them for inspection; run_every is fixed when the fragment is
+    # defined, so the toggle triggers a full rerun (below) to redefine it.
+    pin_refresh = refresh if state.pin_auto_refresh else None
+
+    # ---- Detail column (live fragment) ----
+    @st.fragment(run_every=refresh)
+    def _detail_fragment() -> None:
+        # If the explorer thread died, bounce a full rerun so the page-top
+        # auto-stop/error handling runs.
+        if state.running and not explorer.is_alive:
+            st.rerun(scope="app")
+            return
+        _, live_obs = explorer.get_state()
         node = id_to_node.get(state.selected_id)
         if node is None:
             st.info("Select a node in the tree.")
+            return
+        st.markdown(f"**{node.tag}** — `{node.label}`")
+
+        st.markdown("##### Attributes")
+        if node.attributes:
+            st.table([{"Attribute": k, "Value": v} for k, v in node.attributes.items()])
         else:
-            st.markdown(f"**{node.tag}** — `{node.label}`")
+            st.caption("No attributes.")
 
-            st.markdown("##### Attributes")
-            if node.attributes:
-                st.table([{"Attribute": k, "Value": v} for k, v in node.attributes.items()])
-            else:
-                st.caption("No attributes.")
+        if node.is_data_item:
+            obs: Optional[MtConnectObservation] = live_obs.get(node.id)
+            st.markdown("##### Current Value")
+            if obs:
+                mc1, mc2 = st.columns(2)
+                with mc1:
+                    st.metric("Value", obs.text or "UNAVAILABLE")
+                with mc2:
+                    st.metric("Sequence", obs.attributes.get("sequence", "—"))
+                st.caption(
+                    f"Timestamp: {_fmt_local_ts(obs.attributes.get('timestamp', '—'))}"
+                )
 
-            if node.is_data_item:
-                obs: Optional[MtConnectObservation] = observations.get(node.id)
-                st.markdown("##### Current Value")
-                if obs:
-                    mc1, mc2 = st.columns(2)
-                    with mc1:
-                        st.metric("Value", obs.text or "UNAVAILABLE")
-                    with mc2:
-                        st.metric("Sequence", obs.attributes.get("sequence", "—"))
-                    st.caption(
-                        f"Timestamp: {_fmt_local_ts(obs.attributes.get('timestamp', '—'))}"
-                    )
-
-                    history = explorer.get_history(node.id)
+                history = explorer.get_history(node.id)
+                # Per-node key gives the chart a stable identity that Streamlit
+                # unmounts when the selection changes, so a plot from a previous
+                # node never lingers when the new node has no history to show.
+                with st.container(key=f"exp_hist_{node.id}"):
                     if len(history) > 1:
                         st.markdown("##### History")
                         hc1, hc2 = st.columns([1, 2])
@@ -566,41 +603,63 @@ def explore_page() -> None:
                         state.hist_window_unit = w_unit
                         _render_history(history, timedelta(**{w_unit: int(w_val)}))
 
-                    is_pinned = node.id in state.pinned_items
-                    if st.button(
-                        "✓ In Pinned Plots" if is_pinned else "+ Add to Pinned Plots",
-                        key="exp_add_pin",
-                        disabled=is_pinned,
-                    ):
-                        state.pinned_items.append(node.id)
-                        st.rerun()
-                else:
-                    st.caption("No observation received yet.")
-
+                is_pinned = node.id in state.pinned_items
+                if st.button(
+                    "✓ In Pinned Plots" if is_pinned else "+ Add to Pinned Plots",
+                    key="exp_add_pin",
+                    disabled=is_pinned,
+                ):
+                    state.pinned_items.append(node.id)
+                    # Fragment-scope rerun updates this button now; the pinned
+                    # fragment shows the new plot on its next tick.
+                    st.rerun()
             else:
-                data_items = _subtree_data_items(node)
-                if data_items:
-                    st.markdown("##### DataItems")
-                    rows = []
-                    for di in data_items:
-                        di_obs: Optional[MtConnectObservation] = observations.get(di.id)
-                        rows.append({
-                            "ID": di.id,
-                            "Name": di.label,
-                            "Type": di.attributes.get("type", ""),
-                            "Category": di.attributes.get("category", ""),
-                            "Value": (di_obs.text or "UNAVAILABLE") if di_obs else "—",
-                            "Timestamp": _fmt_local_ts(
-                                di_obs.attributes.get("timestamp", "—")
-                            ) if di_obs else "—",
-                        })
-                    st.dataframe(rows, width="stretch", hide_index=True)
+                st.caption("No observation received yet.")
 
-    pinned = state.pinned_items
-    if pinned:
+        else:
+            data_items = _subtree_data_items(node)
+            if data_items:
+                st.markdown("##### DataItems")
+                rows = []
+                for di in data_items:
+                    di_obs: Optional[MtConnectObservation] = live_obs.get(di.id)
+                    rows.append({
+                        "ID": di.id,
+                        "Name": di.label,
+                        "Type": di.attributes.get("type", ""),
+                        "Category": di.attributes.get("category", ""),
+                        "Value": (di_obs.text or "UNAVAILABLE") if di_obs else "—",
+                        "Timestamp": _fmt_local_ts(
+                            di_obs.attributes.get("timestamp", "—")
+                        ) if di_obs else "—",
+                    })
+                st.dataframe(rows, width="stretch", hide_index=True)
+
+    with detail_col:
+        _detail_fragment()
+
+    # ---- Pinned plots (live fragment) ----
+    @st.fragment(run_every=pin_refresh)
+    def _pinned_fragment() -> None:
+        pinned = state.pinned_items
+        if not pinned:
+            return
         st.markdown("---")
         st.subheader("Pinned Plots")
-        ph1, ph2 = st.columns([1, 2])
+        pa, ph1, ph2 = st.columns([1, 1, 2], vertical_alignment="bottom")
+        with pa:
+            auto = st.toggle(
+                "Auto-Refresh",
+                value=state.pin_auto_refresh,
+                key="exp_pin_auto",
+                help="When on, pinned plots keep updating with live data. Turn it off "
+                "to freeze them for inspection, then back on to resume.",
+            )
+            if auto != state.pin_auto_refresh:
+                # run_every is bound when the fragment is defined, so a full rerun
+                # is needed to re-arm (or disarm) the auto-refresh cadence.
+                state.pin_auto_refresh = auto
+                st.rerun(scope="app")
         with ph1:
             pin_w_val = st.number_input(
                 "Duration", min_value=1, step=1,
@@ -637,6 +696,6 @@ def explore_page() -> None:
             else:
                 st.caption("No history data yet.")
 
-    if state.running:
-        time.sleep(0.5)
-        st.rerun()
+    _pinned_fragment()
+
+    # Liveness is driven by the fragments' run_every above — no full-page rerun.

@@ -16,10 +16,32 @@ def main():
     parser.add_argument("--loopback-test", action="store_true", help="Run the loopback test")
     parser.add_argument("--mirror-test", action="store_true", help="Run the mirror test")
     parser.add_argument("--play-test", action="store_true", help="Run the play test")
+    # Headless SHDR-log -> dataset conversion (no web UI). Providing
+    # --convert-shdr-log runs the converter and exits, mirroring the --*-test
+    # flags above.
+    parser.add_argument("--convert-shdr-log", metavar="LOGFILE",
+                        help="Headless: convert an SHDR .log into a RawMTConnect dataset, then exit")
+    parser.add_argument("--devices", metavar="DEVICESXML",
+                        help="Devices.xml supplying the probe/device models (required with --convert-shdr-log)")
+    parser.add_argument("--out", metavar="OUTFILE",
+                        help="Output dataset path for --convert-shdr-log (default: datasets/<logstem>.jsonl)")
+    parser.add_argument("--sample-interval-ms", type=int, default=250,
+                        help="--convert-shdr-log: observation batching window in ms (default: 250)")
+    parser.add_argument("--device", metavar="NAME",
+                        help="--convert-shdr-log: restrict output to a single device")
     parser.add_argument("--port", type=int, default=8501, help="Port to run the web server on (default: 8501)")
     args = parser.parse_args()
 
     #_signal_register()
+    if args.convert_shdr_log:
+        if not args.devices:
+            parser.error("--convert-shdr-log requires --devices")
+        from .log_converter import convert_log
+        convert_log(
+            args.convert_shdr_log, args.devices, args.out,
+            sample_interval_ms=args.sample_interval_ms, device=args.device,
+        )
+        return
     if args.loopback_test:
         run_loopback_test()
     elif args.mirror_test:

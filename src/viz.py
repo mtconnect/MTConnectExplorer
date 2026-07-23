@@ -221,6 +221,75 @@ try {
       };
     },
 
+    MILL_5AXIS_TRUNNION: function(){
+      // 5-axis trunnion: the head carries X/Y/Z (tool tip = commanded x/y/z in
+      // world), while the table tilts about Y (B1) then rotates about Z (C1).
+      // Nesting root -> trunnion(rot Y) -> table(rot Z) -> stock reproduces the
+      // physical chain, so the tool tip transformed into the table's local frame
+      // (worldToLocal) engraves the toolpath on the tilting/rotating part.
+      var g = spec.geometry, wk = g.work;
+      var piv = g.pivot;                          // [cx, cy, pz]
+      var cx = piv[0], cy = piv[1], pz = piv[2];
+      var half = g.half, sh = g.stock_h;
+      var toolR = (g.tool_dia || 50) / 2;
+      var root = new THREE.Group();
+
+      // Fixed floor grid (X-Y plane).
+      var grid = new THREE.GridHelper(g.limit, 20, 0x3a3f4b, 0x2a2e38);
+      grid.rotation.x = Math.PI / 2;
+      grid.position.set(g.limit / 2, g.limit / 2, 0);
+      root.add(grid);
+
+      // Trunnion cradle — tilts about Y (B1) about the pivot. Two bearing side
+      // plates sit on the tilt axis (+/-Y) with a bottom yoke joining them. Held
+      // at 25% opacity so the cradle never hides the workpiece it carries.
+      var trunnion = new THREE.Group();
+      trunnion.position.set(cx, cy, pz);
+      root.add(trunnion);
+      var armY = half + 70, sideMat = 0x4b5160, trunOpacity = 0.25;
+      var s1 = box(half * 2 + 60, 26, half * 2 + 40, sideMat, trunOpacity); s1.position.set(0, armY, 0); trunnion.add(s1);
+      var s2 = box(half * 2 + 60, 26, half * 2 + 40, sideMat, trunOpacity); s2.position.set(0, -armY, 0); trunnion.add(s2);
+      var yoke = box(half * 2 + 60, armY * 2, 28, sideMat, trunOpacity); yoke.position.set(0, 0, -(sh / 2 + 46)); trunnion.add(yoke);
+
+      // Rotary table — spins about Z (C1) within the tilted cradle; carries the
+      // round table plate and the stock, both centered on the pivot.
+      var table = new THREE.Group();
+      trunnion.add(table);
+      var plate = zCylinder(half + 34, 26, 0x3f4552);
+      plate.position.set(0, 0, -(sh / 2 + 26));
+      table.add(plate);
+      var stock = box(half * 2, half * 2, sh, 0xe8ecf2, 0.92);
+      stock.position.set(0, 0, 0);
+      table.add(stock);
+
+      // Head (carries X/Y/Z): spindle block + downward tool, tip at (x, y, z).
+      var HEAD_UP = 90;
+      var head = box(120, 120, 70, 0xdfe3ea); root.add(head);
+      var tool = zCylinder(toolR, HEAD_UP, 0xd9a441); root.add(tool);
+      var tipDot = new THREE.Mesh(new THREE.SphereGeometry(Math.max(toolR * 0.6, 6), 16, 16),
+        new THREE.MeshLambertMaterial({ color: 0xff5a4d })); root.add(tipDot);
+
+      var wv = new THREE.Vector3();
+      return {
+        root: root,
+        trailParent: table,   // engrave in the rotating/tilting part frame
+        apply: function(state){
+          var x = state.pos[0], y = state.pos[1], z = state.pos[2];
+          var b = d2r(state.pos[3]), c = d2r(state.pos[4]);
+          tool.position.set(x, y, z);
+          head.position.set(x, y, z + HEAD_UP + 36);
+          tipDot.position.set(x, y, z);
+          trunnion.rotation.y = b;
+          table.rotation.z = c;
+          root.updateMatrixWorld(true);
+          // Tool tip in the table's local (part) frame -> the trail engraves it.
+          wv.set(x, y, z);
+          table.worldToLocal(wv);
+          return [wv.x, wv.y, wv.z];
+        }
+      };
+    },
+
     ROBOT_6DOF: function(){
       var g = spec.geometry, links = g.links;
       var root = new THREE.Group();
@@ -362,9 +431,16 @@ try {
     }
 
     var m = st.meta || {};
-    var label = (spec.equipment === 'MILL_3AXIS')
-      ? ('MILL  ' + (m.prog || '') + '\nX ' + fmt(st.pos[0]) + '  Y ' + fmt(st.pos[1]) + '  Z ' + fmt(st.pos[2]) + ' mm')
-      : ('ROBOT  ' + (m.prog || '') + '  grip:' + (m.grip || '') + '\nJ ' + st.pos.map(fmt).join('  ') + ' deg');
+    var label;
+    if (spec.equipment === 'MILL_3AXIS'){
+      label = 'MILL  ' + (m.prog || '') + '\nX ' + fmt(st.pos[0]) + '  Y ' + fmt(st.pos[1]) + '  Z ' + fmt(st.pos[2]) + ' mm';
+    } else if (spec.equipment === 'MILL_5AXIS_TRUNNION'){
+      label = 'MILL 5X  ' + (m.prog || '') + '  [' + (m.rmode || '') + ']'
+            + '\nX ' + fmt(st.pos[0]) + '  Y ' + fmt(st.pos[1]) + '  Z ' + fmt(st.pos[2]) + ' mm'
+            + '\nB ' + fmt(st.pos[3]) + '  C ' + fmt(st.pos[4]) + ' deg';
+    } else {
+      label = 'ROBOT  ' + (m.prog || '') + '  grip:' + (m.grip || '') + '\nJ ' + st.pos.map(fmt).join('  ') + ' deg';
+    }
     hud.textContent = label + '\ncycle ' + fmt(phase) + ' / ' + fmt(CYCLE) + ' s';
 
     controls.update();

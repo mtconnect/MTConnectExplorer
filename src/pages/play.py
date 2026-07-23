@@ -3,6 +3,7 @@ import threading
 import time
 from typing import List, Optional
 
+import pandas as pd
 import streamlit as st
 
 from src.agent import Agent, AgentConfig, AgentAdapter
@@ -10,6 +11,7 @@ from src.converter import MtConnectDatasetPlayer, XmlToShdrConverter
 from src.pages.core import (
     DATASETS_DIR,
     PlayConfig,
+    PlayDeviceAdapter,
     PlaybackSession,
     PlayPageState,
     agent_url,
@@ -29,47 +31,55 @@ def _play_worker(
     play_config: PlayConfig,
     dataset_path: str,
     stop_event: threading.Event,
+    started_event: threading.Event,
     log_label: str,
 ) -> None:
     _log = logging.getLogger(__name__)
     agent: Optional[Agent] = None
-    player: Optional[MtConnectDatasetPlayer] = None
+    players: List[MtConnectDatasetPlayer] = []
     try:
         _log.info("starting agent...")
 
+        # One agent fronting one SHDR adapter per selected device.
         agent = Agent(AgentConfig(
-            adapters=[AgentAdapter(
-                name=play_config.device_name,
-                host=play_config.player_host,
-                port=play_config.player_port,
-            )],
+            adapters=[
+                AgentAdapter(name=d.device_name, host=d.player_host, port=d.player_port)
+                for d in play_config.devices
+            ],
             port=play_config.agent_port,
             mtconnect_version=play_config.mtconnect_version,
             asset_buffer_size=play_config.asset_buffer_size,
             buffer_size=play_config.buffer_size,
         )).start()
 
-        _log.info("starting adapter...")
+        _log.info("starting %d adapter(s)...", len(play_config.devices))
 
-        player = MtConnectDatasetPlayer(
-            play_config.player_host,
-            play_config.player_port,
-            play_config.re_timestamp,
-            play_config.loop,
-            thread_name=session_thread_name(log_label, "dataset-player"),
-        ).open(dataset_path, play_config.device_name, False)
+        # Each player binds its own SHDR adapter (autoplay deferred) and reads the
+        # same dataset file through its own handle, filtered to its device.
+        for d in play_config.devices:
+            players.append(MtConnectDatasetPlayer(
+                d.player_host,
+                d.player_port,
+                play_config.re_timestamp,
+                play_config.loop,
+                thread_name=session_thread_name(log_label, f"dataset-player-{d.device_name}"),
+            ).open(dataset_path, d.device_name, False))
 
-        _log.info("waiting for agent to connect to adapter...")
-        while not player._adapter.agent_is_connected:
+        _log.info("waiting for agent to connect to all adapters...")
+        while not all(p._adapter.agent_is_connected for p in players):
             if stop_event.is_set():
                 _log.info("playback aborted")
                 return
             time.sleep(0.1)
-        player.play()
+        for p in players:
+            p.play()
+        # The agent has connected to every adapter and data is now streaming;
+        # flip the session status from "starting" to playing.
+        started_event.set()
 
         _log.info("playback started")
 
-        while not player.is_finished:
+        while not all(p.is_finished for p in players):
             if stop_event.is_set():
                 break
             time.sleep(0.1)
@@ -82,11 +92,11 @@ def _play_worker(
     except Exception as ex:
         _log.error(f"play worker error: {ex}")
     finally:
-        try:
-            if player is not None:
-                player.stop()
-        except Exception:
-            pass
+        for p in players:
+            try:
+                p.stop()
+            except Exception:
+                pass
         try:
             if agent is not None:
                 agent.stop()
@@ -94,9 +104,10 @@ def _play_worker(
             pass
 
 
-def _session_label(dataset_file: str, device_name: str, agent_port: int) -> str:
+def _session_label(dataset_file: str, device_names: List[str], agent_port: int) -> str:
     """Human-readable session label used to tag log lines and label the grid."""
-    return f"{dataset_file} | {device_name} | localhost:{agent_port}"
+    devices = ", ".join(device_names) if device_names else "no devices"
+    return f"{dataset_file} | {devices} | localhost:{agent_port}"
 
 
 def _next_free_port(start: int, used: set) -> int:
@@ -172,7 +183,7 @@ def play_page() -> None:
             head_l, head_r = st.columns([3, 1])
             head_l.subheader("Now Playing")
             with head_r:
-                if st.button("Stop All", use_container_width=True):
+                if st.button("Stop All", width="stretch"):
                     with get_state_lock():
                         for sid in list(state.sessions):
                             _remove_session(state, sid)
@@ -187,12 +198,21 @@ def play_page() -> None:
             for sid, sess in list(state.sessions.items()):
                 c = st.columns([3, 2, 3, 2, 1])
                 c[0].write(sess.dataset_file)
-                c[1].write(sess.config.device_name)
+                c[1].write(", ".join(d.device_name for d in sess.config.devices))
                 c[2].write(agent_url(sess.config.agent_port))
                 alive = sess.worker is not None and sess.worker.is_alive()
-                c[3].write(("looping" if sess.config.loop else "playing") if alive else "stopping")
+                started_ev = getattr(sess, "started", None)
+                started = started_ev is not None and started_ev.is_set()
+                if not alive:
+                    status = "stopping"
+                elif not started:
+                    # Agent still booting / connecting to the SHDR adapter(s).
+                    status = "starting"
+                else:
+                    status = "looping" if sess.config.loop else "playing"
+                c[3].write(status)
                 with c[4]:
-                    if st.button("Stop", key=f"play_stop_{sid}", use_container_width=True):
+                    if st.button("Stop", key=f"play_stop_{sid}", width="stretch"):
                         with get_state_lock():
                             _remove_session(state, sid)
                         st.rerun()
@@ -229,19 +249,6 @@ def play_page() -> None:
             except Exception:
                 device_names = []
 
-        current_device_name = play_config.device_name
-        if current_device_name not in device_names:
-            current_device_name = device_names[0] if device_names else ""
-
-        device_name = st.selectbox(
-            "Device",
-            device_names if device_names else ["(none)"],
-            index=device_names.index(current_device_name) if current_device_name in device_names else 0,
-            disabled=not device_names,
-            key="play_device_name",
-            filter_mode=None,  # Disable search/text input
-        )
-
         re_timestamp = st.checkbox(
             "Re-Timestamp",
             value=play_config.re_timestamp,
@@ -259,14 +266,64 @@ def play_page() -> None:
             "model is reused and only the recorded observations are replayed.",
         )
 
-        # Ports must be unique across simultaneously-running sessions. Pre-fill the
-        # next free ports, but let the user override. The widget keys include the
-        # session counter so they re-seed to the next free port after each launch
-        # while still persisting manual edits between launches.
+        # Ports must be unique across simultaneously-running Play/Simulator
+        # sessions. Pre-fill free ports but let the user override; widget keys embed
+        # the session counter so they re-seed to the next free ports after each
+        # launch while still persisting manual edits between launches.
         used_ports = _used_ports(state)
         suggested_agent = _next_free_port(PlayConfig.model_fields["agent_port"].default, used_ports)
-        suggested_player = _next_free_port(PlayConfig.model_fields["player_port"].default, used_ports)
         gen = state.next_id
+
+        # --- Devices: one selectable SHDR adapter per device in the dataset ---
+        st.subheader("Devices")
+        default_host = AgentAdapter.model_fields["host"].default
+        # Seed each device a distinct free SHDR port (skipping ports already in use
+        # and those just assigned to earlier rows).
+        seeded = set(used_ports)
+        seed_rows = []
+        next_port = AgentAdapter.model_fields["port"].default
+        for name in device_names:
+            next_port = _next_free_port(next_port, seeded)
+            seeded.add(next_port)
+            seed_rows.append({
+                "Enabled": True,
+                "Device": name,
+                "SHDR Adapter Host": default_host,
+                "SHDR Adapter Port": next_port,
+            })
+            next_port += 1
+
+        devices_df = None
+        if device_names:
+            devices_df = st.data_editor(
+                pd.DataFrame(
+                    seed_rows,
+                    columns=["Enabled", "Device", "SHDR Adapter Host", "SHDR Adapter Port"],
+                ),
+                column_config={
+                    "Enabled": st.column_config.CheckboxColumn("Enabled", width="small"),
+                    "Device": st.column_config.TextColumn("Device", disabled=True),
+                    "SHDR Adapter Host": st.column_config.TextColumn("SHDR Adapter Host"),
+                    "SHDR Adapter Port": st.column_config.NumberColumn(
+                        "SHDR Adapter Port", min_value=1, max_value=65535, step=1, format="%d",
+                    ),
+                },
+                hide_index=True,
+                num_rows="fixed",
+                width="stretch",
+                key=f"play_devices_{dataset_file}_{gen}",
+            )
+
+        # Enabled rows -> the adapters this session will spin up.
+        selected: List[PlayDeviceAdapter] = []
+        if devices_df is not None:
+            for _, row in devices_df.iterrows():
+                if bool(row["Enabled"]):
+                    selected.append(PlayDeviceAdapter(
+                        device_name=str(row["Device"]),
+                        player_host=str(row["SHDR Adapter Host"]).strip(),
+                        player_port=int(row["SHDR Adapter Port"]),
+                    ))
 
         # --- Agent config ---
         st.subheader("Agent Configuration")
@@ -290,29 +347,23 @@ def play_page() -> None:
                 key="play_buf_size",
             )
 
-        # --- SHDR Adapter ---
-        st.subheader("SHDR Adapter")
-        c1, c2 = st.columns(2)
-        with c1:
-            player_host = st.text_input(
-                "Host", value=play_config.player_host, key="play_player_host",
-            )
-        with c2:
-            player_port = st.number_input(
-                "Port", value=suggested_player, min_value=1, max_value=65535, step=1,
-                key=f"play_player_port_{gen}",
-            )
-
-        # Validate ports against running sessions; disable Play until they are valid.
+        # Validate ports; disable Play until valid.
         agent_port = int(agent_port)
-        player_port = int(player_port)
         conflicts: List[str] = []
+        if not selected:
+            conflicts.append("enable at least one device")
         if agent_port in used_ports:
             conflicts.append(f"agent port {agent_port} is in use")
-        if player_port in used_ports:
-            conflicts.append(f"SHDR port {player_port} is in use")
-        if agent_port == player_port:
-            conflicts.append("agent and SHDR ports must differ")
+        seen_ports: dict = {}
+        for d in selected:
+            if d.player_port == agent_port:
+                conflicts.append(f"{d.device_name}: SHDR port {d.player_port} equals the agent port")
+            if d.player_port in used_ports:
+                conflicts.append(f"{d.device_name}: SHDR port {d.player_port} is in use")
+            seen_ports.setdefault(d.player_port, []).append(d.device_name)
+        for port, names in seen_ports.items():
+            if len(names) > 1:
+                conflicts.append(f"SHDR port {port} reused by {', '.join(names)}")
         ports_valid = not conflicts
         if conflicts:
             st.error("Cannot start: " + "; ".join(conflicts) + ".")
@@ -321,14 +372,15 @@ def play_page() -> None:
         play_clicked = st.button(
             "Play",
             disabled=not file_names or not device_names or not ports_valid,
-            use_container_width=True, type="primary",
+            width="stretch", type="primary",
         )
 
-        if play_clicked and file_names and device_names:
+        if play_clicked and file_names and selected:
             with get_state_lock():
-                # Re-validate under the lock — another user may have taken the port.
+                # Re-validate under the lock — another user may have taken a port.
                 used_now = _used_ports(state)
-                if agent_port in used_now or player_port in used_now or agent_port == player_port:
+                clashing = [d.device_name for d in selected if d.player_port in used_now]
+                if agent_port in used_now or clashing:
                     st.warning("Those ports were just taken by another session. Adjust and retry.")
                 else:
                     final_config = PlayConfig(
@@ -336,26 +388,27 @@ def play_page() -> None:
                         mtconnect_version=str(mtc_version),
                         asset_buffer_size=int(asset_buf),
                         buffer_size=int(buf_size),
-                        player_host=str(player_host),
-                        player_port=player_port,
-                        device_name=str(device_name),
                         re_timestamp=bool(re_timestamp),
                         loop=bool(loop),
+                        devices=selected,
                     )
-                    # Remember non-port settings as defaults for the next launch.
+                    # Remember non-device settings as defaults for the next launch.
                     state.config = final_config
 
                     sid = str(state.next_id)
                     state.next_id += 1
-                    label = _session_label(str(dataset_file), str(device_name), agent_port)
+                    device_names_sel = [d.device_name for d in selected]
+                    label = _session_label(str(dataset_file), device_names_sel, agent_port)
 
                     if state.handler is None:
                         state.handler = attach_session_log(state.log_q, state.sessions)
 
                     stop_event = threading.Event()
+                    started_event = threading.Event()
                     worker = threading.Thread(
                         target=_play_worker,
-                        args=(final_config, str(DATASETS_DIR / dataset_file), stop_event, label),
+                        args=(final_config, str(DATASETS_DIR / dataset_file),
+                              stop_event, started_event, label),
                         name=session_thread_name(label, "worker"),
                         daemon=True,
                     )
@@ -366,6 +419,7 @@ def play_page() -> None:
                         config=final_config,
                         worker=worker,
                         stop_event=stop_event,
+                        started=started_event,
                     )
                     worker.start()
                     st.rerun()

@@ -23,7 +23,29 @@ from src.pages.core import (
     session_thread_name,
 )
 
-_EQUIPMENT_OPTIONS = [EquipmentType.MILL_3AXIS, EquipmentType.ROBOT_6DOF]
+_EQUIPMENT_OPTIONS = [
+    EquipmentType.MILL_3AXIS,
+    EquipmentType.MILL_5AXIS_TRUNNION,
+    EquipmentType.ROBOT_6DOF,
+]
+
+# Map equipment-type values from older sessions to their current member. The
+# shared state store (and per-session widget state) outlives code reloads, so a
+# value saved before an enum was renamed can linger; without this it would raise
+# ``ValueError: '<old>' is not a valid EquipmentType`` on the next rerun.
+_LEGACY_EQUIPMENT_ALIASES = {
+    "MILL_5AXIS": EquipmentType.MILL_5AXIS_TRUNNION,
+}
+
+
+def _coerce_equipment(value) -> EquipmentType:
+    """Resolve a stored equipment-type value to a valid EquipmentType, remapping
+    known legacy values and otherwise falling back to the first option — so a
+    stale value never crashes the page."""
+    try:
+        return EquipmentType(value)
+    except ValueError:
+        return _LEGACY_EQUIPMENT_ALIASES.get(str(value), _EQUIPMENT_OPTIONS[0])
 
 
 def _sim_worker(
@@ -170,7 +192,7 @@ def _visualize_dialog(sid: str) -> None:
         st.info("Simulation is still starting — reopen this view in a moment to see the 3D model.")
         return
 
-    equipment = EquipmentType(sess.config.equipment_type)
+    equipment = _coerce_equipment(sess.config.equipment_type)
     st.caption(
         f"{equipment.label} — {sess.config.device_name} — {sess.config.routine}"
         "  ·  middle-drag: rotate · right-drag: pan · scroll: zoom · motion synced to live data"
@@ -231,7 +253,7 @@ def simulator_page() -> None:
             head_l, head_r = st.columns([3, 1])
             head_l.subheader("Now Simulating")
             with head_r:
-                if st.button("Stop All", use_container_width=True):
+                if st.button("Stop All", width="stretch"):
                     with get_state_lock():
                         for sid in list(state.sessions):
                             _remove_session(state, sid)
@@ -247,7 +269,7 @@ def simulator_page() -> None:
             h[6].markdown("**Stop**")
             for sid, sess in list(state.sessions.items()):
                 c = st.columns([2, 2, 3, 2, 2, 1, 1])
-                c[0].write(EquipmentType(sess.config.equipment_type).label)
+                c[0].write(_coerce_equipment(sess.config.equipment_type).label)
                 c[1].write(sess.config.device_name)
                 c[2].write(agent_url(sess.config.agent_port))
                 c[3].write(str(sess.config.tick_ms))
@@ -264,13 +286,13 @@ def simulator_page() -> None:
                     if st.button(
                         "View",
                         key=f"sim_view_{sid}",
-                        use_container_width=True,
+                        width="stretch",
                         disabled=not ready,
                         help=None if ready else "Available once the simulation has started",
                     ):
                         _visualize_dialog(sid)
                 with c[6]:
-                    if st.button("Stop", key=f"sim_stop_{sid}", use_container_width=True):
+                    if st.button("Stop", key=f"sim_stop_{sid}", width="stretch"):
                         with get_state_lock():
                             _remove_session(state, sid)
                         st.rerun()
@@ -288,7 +310,14 @@ def simulator_page() -> None:
         # --- Start Simulating (at the top, like Play's launch settings) ---
         st.subheader("Start Simulating")
 
-        current_equipment = EquipmentType(sim_config.equipment_type)
+        current_equipment = _coerce_equipment(sim_config.equipment_type)
+        # Repair a stale/renamed stored value so it isn't re-coerced every rerun.
+        sim_config.equipment_type = current_equipment.value
+        # The selectbox's own widget state also survives reloads; drop a value
+        # left by an older code version so it re-seeds from `index` instead of
+        # raising "the default value is not part of the options".
+        if st.session_state.get("sim_equipment") not in _EQUIPMENT_OPTIONS:
+            st.session_state.pop("sim_equipment", None)
         equipment: EquipmentType = st.selectbox(
             "Equipment Type",
             _EQUIPMENT_OPTIONS,
@@ -322,11 +351,14 @@ def simulator_page() -> None:
         )
 
         with st.expander("Equipment Configuration"):
-            st.caption(
-                "No equipment-specific settings yet. "
-                + ("Mill axes are fixed at 0–1000 mm." if equipment == EquipmentType.MILL_3AXIS
-                   else "Robot joints follow a generic 6-DOF kinematic layout.")
-            )
+            if equipment == EquipmentType.MILL_3AXIS:
+                _eq_note = "Mill axes are fixed at 0–1000 mm."
+            elif equipment == EquipmentType.MILL_5AXIS_TRUNNION:
+                _eq_note = ("Head carries X/Y/Z; the trunnion table tilts about Y (B1) "
+                            "and rotates about Z (C1). The spindle is axis S.")
+            else:
+                _eq_note = "Robot joints follow a generic 6-DOF kinematic layout."
+            st.caption("No equipment-specific settings yet. " + _eq_note)
 
         # Ports must be unique across simultaneously-running sessions (Play +
         # Simulator). Pre-fill the next free ports but let the user override.
@@ -388,7 +420,7 @@ def simulator_page() -> None:
         simulate_clicked = st.button(
             "Simulate",
             disabled=not ports_valid or not str(device_name).strip(),
-            use_container_width=True, type="primary",
+            width="stretch", type="primary",
         )
 
         if simulate_clicked and str(device_name).strip():

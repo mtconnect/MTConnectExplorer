@@ -245,6 +245,11 @@ class ExplorePageState(BaseModel):
         "minutes",
         description="Duration unit (seconds/minutes/hours/days) for the Pinned Plots window.",
     )
+    pin_auto_refresh: bool = Field(
+        True,
+        description="Whether Pinned Plots auto-refresh with live data. When off, the "
+        "plots freeze so data can be examined without them moving.",
+    )
     last_error: Optional[str] = Field(
         None,
         description="Most recent connection error message, shown after the explorer stops.",
@@ -352,6 +357,25 @@ class DatasetsPageState(BaseModel):
 # ---------------------------------------------------------------------------
 # Play page
 # ---------------------------------------------------------------------------
+class PlayDeviceAdapter(BaseModel):
+    """One device selected for playback and the SHDR adapter that will feed it.
+
+    A Play session runs one agent fronting several of these — one SHDR adapter
+    (its own host/port) per selected device."""
+
+    device_name: str = Field(
+        description="Device name (from the dataset) to replay through this adapter",
+    )
+    player_host: str = Field(
+        AgentAdapter.model_fields["host"].default,
+        description="SHDR adapter host address",
+    )
+    player_port: int = Field(
+        AgentAdapter.model_fields["port"].default,
+        description="SHDR adapter port (unique across all running Play/Simulator sessions)",
+    )
+
+
 class PlayConfig(BaseModel):
     """Configuration captured from the Play page form."""
 
@@ -371,17 +395,10 @@ class PlayConfig(BaseModel):
         AgentConfig.model_fields["buffer_size"].default,
         description="Agent circular buffer size",
     )
-    player_host: str = Field(
-        AgentAdapter.model_fields["host"].default,
-        description="SHDR adapter host address",
-    )
-    player_port: int = Field(
-        AgentAdapter.model_fields["port"].default,
-        description="SHDR adapter port",
-    )
-    device_name: str = Field(
-        "",
-        description="Device name from dataset to play back",
+    devices: List["PlayDeviceAdapter"] = Field(
+        default_factory=list,
+        description="Selected devices to replay; one SHDR adapter is spun up per entry "
+        "and the single agent connects to all of them.",
     )
     re_timestamp: bool = Field(
         True,
@@ -418,6 +435,11 @@ class PlaybackSession(BaseModel):
     stop_event: Optional[threading.Event] = Field(
         None,
         description="Event used to signal this session's worker thread to stop.",
+    )
+    started: Optional[threading.Event] = Field(
+        None,
+        description="Set by the worker once the agent has connected to every SHDR "
+        "adapter and playback has begun; drives the 'starting' vs 'playing' status.",
     )
 
 
@@ -464,7 +486,7 @@ class SimulatorConfig(BaseModel):
 
     equipment_type: str = Field(
         EquipmentType.MILL_3AXIS.value,
-        description="Equipment type key (see EquipmentType): MILL_3AXIS or ROBOT_6DOF.",
+        description="Equipment type key (see EquipmentType): MILL_3AXIS, MILL_5AXIS_TRUNNION, or ROBOT_6DOF.",
     )
     device_name: str = Field(
         "",
@@ -475,7 +497,7 @@ class SimulatorConfig(BaseModel):
         description="Label of the selected canned routine.",
     )
     tick_ms: int = Field(
-        30,
+        10,
         description="Interval in milliseconds at which generated observations are fed "
         "to the SHDR adapter.",
     )
@@ -635,10 +657,15 @@ def get_simulator_state() -> SimulatorPageState:
 def all_used_ports() -> set:
     """Agent + SHDR ports in use by every running Play and Simulator session."""
     used: set = set()
-    for state in (get_play_state(), get_simulator_state()):
-        for s in state.sessions.values():
-            used.add(s.config.agent_port)
-            used.add(s.config.player_port)
+    # Play sessions front one agent with N SHDR adapters (one per device).
+    for s in get_play_state().sessions.values():
+        used.add(s.config.agent_port)
+        for d in s.config.devices:
+            used.add(d.player_port)
+    # Simulator sessions have a single SHDR adapter.
+    for s in get_simulator_state().sessions.values():
+        used.add(s.config.agent_port)
+        used.add(s.config.player_port)
     return used
 
 
