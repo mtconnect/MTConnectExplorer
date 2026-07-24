@@ -9,6 +9,24 @@ call dev.bat no_pause || (
     exit /b %ERRORLEVEL%
 )
 
+:: Build the client wheel and install it over the editable install so the
+:: frozen binary uses (and proves) the real wheel
+echo Building client wheel...
+IF EXIST "lib\dist" RD /S /Q "lib\dist"
+venv\Scripts\python.exe -m build --wheel lib || (
+    echo Error: Could not build the client wheel
+    pause
+    exit /b %ERRORLEVEL%
+)
+for %%f in (lib\dist\*.whl) do (
+    venv\Scripts\pip.exe install --force-reinstall "%%f" || (
+        echo Error: Could not install the client wheel
+        pause
+        exit /b 1
+    )
+)
+echo Built client wheel
+
 echo Building application...
 venv\Scripts\pyinstaller.exe installer.spec --clean || (
     echo Error: Could not update venv requirements

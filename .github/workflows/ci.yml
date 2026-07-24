@@ -59,6 +59,23 @@ jobs:
 
           echo "OK: __version__ '$version' matches target branch '$base'."
 
+  test:
+    # API/service test suite (tests/). Tests that need the bundled MTConnect
+    # agent binary self-skip when src/bin/agent is absent, so this job only
+    # builds the venv (not the agent). Not a required status check (yet).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Set up venv
+        run: |
+          python -m venv venv
+          venv/bin/pip install -Ur requirements-src.txt
+      - name: Run pytest
+        run: venv/bin/python -m pytest tests -q
+
   build-linux:
     runs-on: ubuntu-latest
     steps:

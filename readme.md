@@ -218,6 +218,50 @@ The `Datasets` page allows you to view, upload, download, rename, and delete dat
 
 ![Datasets Page](.github/Datasets1.png)
 
+## HTTP API
+
+Everything the backend owns — capture, play, and simulate sessions; datasets;
+events/logs; ports; running agents — is drivable over a REST API served by the
+same process as the UI (UI at `/`, API at `/api/v1`, interactive docs at
+`/api/docs`). The full contract lives in [docs/api.md](docs/api.md).
+
+- **Auth:** send `X-API-Key: <key>` on every request, where `<key>` is the
+  `api_key` field in `config.json`. `GET /api/v1/health` needs no key.
+- **Bind address:** the server binds `127.0.0.1` by default; pass
+  `--host <addr>` to expose it. Exposing without an `api_key` configured is
+  refused at startup.
+- **Events:** `GET /api/v1/events/stream` streams logs and session status
+  changes as NDJSON with cursor-based reconnect (see docs/api.md §8).
+
+### Configuration
+
+`config.json` is optional and lives in the working directory (next to the
+binary, or the repo root in development). It is parsed as JSONC, so `//` and
+`/* */` comments are allowed:
+
+```jsonc
+{
+    // Logging verbosity: debug, info, warning, error, or critical (default: info).
+    "log_level": "info",
+
+    // API key accepted in the X-API-Key header. Required to bind a non-local
+    // --host; without it the API is only reachable by the built-in UI.
+    "api_key": "replace-with-a-long-random-secret"
+}
+```
+
+A Python client ships as the `mtconnect-explorer-client` wheel (built from
+[lib/](lib/), which is also the home of the API's pydantic schemas):
+
+```python
+from mtconnect_explorer_client import ApiClient
+
+client = ApiClient("http://127.0.0.1:8501/api/v1", api_key="<config.json api_key>")
+session = client.simulate_start(equipment_type="MILL_3AXIS", device_name="Mill")
+for event in client.events_stream(scope="simulate"):
+    print(event)
+```
+
 ## Play
 
 The `Play` page allows you to play a `.jsonl` dataset.

@@ -21,8 +21,20 @@ from src.pages.core import (
     get_explore_state,
     get_global_state,
     get_state_lock,
-    running_agent_urls,
 )
+
+
+def running_agent_urls():
+    """Base URLs of local agents run by live Play/Simulate sessions (via the
+    API — the quick-fill buttons are this page's only backend touch; Explore
+    otherwise talks directly to MTConnect agents, the documented carve-out)."""
+    from mtconnect_explorer_client import ApiError
+    from src.pages.api import get_client
+
+    try:
+        return [a.base_url for a in get_client().agents_list()]
+    except ApiError:
+        return []
 
 _log = logging.getLogger(__name__)
 

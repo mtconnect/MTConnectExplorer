@@ -1,107 +1,79 @@
-import logging
-import re
-import time
-from datetime import datetime, timezone
-
 import streamlit as st
 
-from src.client import (
-    MtConnectClientConfiguration,
-    MtConnectDataCollector,
-    MtConnectDataCollectorConfiguration,
-)
+from mtconnect_explorer_client import ApiError
+from mtconnect_explorer_client.schemas import CaptureCreate
+
+from src.pages.api import get_client, get_feed
 from src.pages.core import (
-    DATASETS_DIR,
     CaptureConfig,
-    CaptureSession,
-    CapturePageState,
     GlobalState,
-    agent_url,
-    attach_session_log,
-    detach_log,
-    drain,
     get_capture_state,
     get_global_state,
     get_state_lock,
     log_area,
-    running_agent_urls,
-    session_thread_name,
 )
 
 
-_log = logging.getLogger(__name__)
+def _backend_fingerprint() -> tuple:
+    """What this page renders from the backend: capture sessions (id, status)
+    plus the running-agent quick-fill URLs."""
+    client = get_client()
+    return (
+        tuple(sorted((s.id, s.status) for s in client.capture_list())),
+        tuple(sorted(a.base_url for a in client.agents_list())),
+    )
 
 
-def _filename(base_url: str) -> str:
-    cleaned = re.sub(
-        r"_+", "_",
-        re.sub(r"[^a-zA-Z0-9._-]", "_", base_url.replace("://", "_").rstrip("/"))
-    ).strip("_")
-    return f"{cleaned}-{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%SZ')}.jsonl"
-
-
-def _unique_filename(base_url: str, state: CapturePageState) -> str:
-    """A dataset filename for this capture that doesn't collide with an existing
-    file or another in-progress capture."""
-    active = {s.filename for s in state.sessions.values()}
-    name = _filename(base_url)
-    if not (DATASETS_DIR / name).exists() and name not in active:
-        return name
-    stem, _, ext = name.rpartition(".")
-    i = 2
-    while True:
-        candidate = f"{stem}-{i}.{ext}"
-        if not (DATASETS_DIR / candidate).exists() and candidate not in active:
-            return candidate
-        i += 1
-
-
-def _capture_label(filename: str, base_url: str) -> str:
-    """Human-readable session label used to tag log lines and label the grid."""
-    return f"{filename} | {base_url}"
-
-
-def _sync_log_handler(state: CapturePageState) -> None:
-    """Detach the consolidated log handler once no captures remain. Caller holds the lock."""
-    if not state.sessions and state.handler is not None:
-        detach_log(state.handler)
-        state.handler = None
-
-
-def _remove_session(state: CapturePageState, sid: str) -> None:
-    """Stop a capture's collector and drop it. Caller holds the lock."""
-    sess = state.sessions.get(sid)
-    if sess is None:
+@st.fragment(run_every=1.0)
+def _watch_backend_fragment() -> None:
+    """The API can change sessions behind this page's back — poll the backend
+    and trigger a full-page rerun only when what the page rendered has actually
+    changed, so idle pages pick up API-driven starts/stops without constant
+    rerun churn."""
+    try:
+        current = _backend_fingerprint()
+    except ApiError:
         return
-    if sess.collector is not None:
-        try:
-            sess.collector.stop()
-        except Exception:
-            pass
-    state.sessions.pop(sid, None)
-    _sync_log_handler(state)
+    if current != st.session_state.get("cap_backend_fp"):
+        st.rerun(scope="app")
 
 
-def _reap_finished(state: CapturePageState) -> None:
-    """Drop captures whose collector exited on its own. Caller holds the lock."""
-    for sid, sess in list(state.sessions.items()):
-        if sess.collector is None or not sess.collector.is_alive:
-            state.sessions.pop(sid, None)
-    _sync_log_handler(state)
+@st.fragment(run_every=0.5)
+def _log_output_fragment() -> None:
+    """Live-refresh the consolidated log via a fragment (partial) rerun."""
+    log_area("cap_log_area", get_feed("capture").lines)
 
 
 def capture_page() -> None:
     st.set_page_config(page_title="MTConnectExplorer", layout="wide")
     st.title("Capture")
 
+    client = get_client()
+    feed = get_feed("capture")
     global_state = get_global_state()
     state = get_capture_state()
 
-    drain(state.log_q, state.log_lines)
-
-    # Reap captures whose collector has finished/died so the grid stays accurate.
-    with get_state_lock():
-        _reap_finished(state)
+    # Auto-delete terminal sessions (finished/error) so the grid reaps
+    # instantly, exactly like the pre-API behavior.
+    sessions = []
+    try:
+        for sess in client.capture_list():
+            if sess.status in ("finished", "error"):
+                try:
+                    client.capture_stop(sess.id)
+                except ApiError:
+                    pass
+            else:
+                sessions.append(sess)
+    except ApiError as ex:
+        st.error(f"API error: {ex.message}")
+    feed.update_labels(sessions)
+    # Snapshot what this render is based on; the watcher fragment reruns the
+    # page when the backend diverges from it (e.g. API-driven start/stop).
+    try:
+        st.session_state["cap_backend_fp"] = _backend_fingerprint()
+    except ApiError:
+        pass
 
     config: CaptureConfig = state.config
 
@@ -113,15 +85,16 @@ def capture_page() -> None:
     form_container = st.container()
 
     # --- Capturing ---
-    if state.sessions:
+    if sessions:
         with capturing_container:
             head_l, head_r = st.columns([3, 1])
             head_l.subheader("Capturing")
             with head_r:
                 if st.button("Stop All", width="stretch"):
-                    with get_state_lock():
-                        for sid in list(state.sessions):
-                            _remove_session(state, sid)
+                    try:
+                        client.capture_stop_all()
+                    except ApiError as ex:
+                        feed.post_ui(f"stop all failed: {ex.message}")
                     st.rerun()
 
             h = st.columns([4, 3, 2, 2, 1])
@@ -130,17 +103,18 @@ def capture_page() -> None:
             h[2].markdown("**Mode**")
             h[3].markdown("**Status**")
             h[4].markdown("**Stop**")
-            for sid, sess in list(state.sessions.items()):
+            for sess in sessions:
                 c = st.columns([4, 3, 2, 2, 1])
-                c[0].write(sess.filename)
-                c[1].write(sess.base_url)
+                c[0].write(sess.config.filename)
+                c[1].write(sess.config.base_url)
                 c[2].write(sess.config.mode)
-                alive = sess.collector is not None and sess.collector.is_alive
-                c[3].write("capturing" if alive else "stopping")
+                c[3].write("stopping" if sess.status == "stopping" else "capturing")
                 with c[4]:
-                    if st.button("Stop", key=f"cap_stop_{sid}", width="stretch"):
-                        with get_state_lock():
-                            _remove_session(state, sid)
+                    if st.button("Stop", key=f"cap_stop_{sess.id}", width="stretch"):
+                        try:
+                            client.capture_stop(sess.id)
+                        except ApiError as ex:
+                            feed.post_ui(f"stop failed: {ex.message}")
                         st.rerun()
             st.divider()
 
@@ -152,7 +126,10 @@ def capture_page() -> None:
         # as entered — tab, enter, or clicking Start all commit it. Currently-
         # running local agents (Play and Simulator sessions) are offered as
         # one-click quick-fills below.
-        playing_urls = running_agent_urls()
+        try:
+            playing_urls = [a.base_url for a in client.agents_list()]
+        except ApiError:
+            playing_urls = []
         default_url = GlobalState.model_fields["base_url"].default
         if "cap_base_url" not in st.session_state:
             st.session_state["cap_base_url"] = global_state.base_url or default_url
@@ -221,52 +198,30 @@ def capture_page() -> None:
         if start_clicked and str(base_url).strip():
             with get_state_lock():
                 global_state.base_url = str(base_url)
-                new_config = CaptureConfig(
+                state.config = CaptureConfig(
                     interval_ms=int(stream_interval_ms),
                     mode=str(mode),
                 )
-                state.config = new_config
-
-                DATASETS_DIR.mkdir(exist_ok=True)
-                filename = _unique_filename(str(base_url), state)
-                label = _capture_label(filename, str(base_url))
-
-                if state.handler is None:
-                    state.handler = attach_session_log(state.log_q, state.sessions)
-
-                sid = str(state.next_id)
-                state.next_id += 1
-                try:
-                    collector = MtConnectDataCollector(
-                        MtConnectDataCollectorConfiguration(
-                            configuration=MtConnectClientConfiguration(
-                                base_url=str(base_url),
-                                timeout=new_config.timeout,
-                                chunk_size=new_config.chunk_size,
-                            ),
-                            stream_interval_ms=new_config.interval_ms,
-                            mode=new_config.mode,
-                        ),
-                        thread_name=session_thread_name(label, "collector"),
-                    ).start(str(DATASETS_DIR / filename))
-                except Exception as ex:
-                    _sync_log_handler(state)
-                    st.error(f"Failed to start capture: {ex}")
-                else:
-                    state.sessions[sid] = CaptureSession(
-                        id=sid,
-                        label=label,
-                        filename=filename,
-                        base_url=str(base_url),
-                        config=new_config,
-                        collector=collector,
-                    )
-                    st.rerun()
+            try:
+                client.capture_start(CaptureCreate(
+                    base_url=str(base_url),
+                    mode=state.config.mode,
+                    interval_ms=state.config.interval_ms,
+                    timeout_s=state.config.timeout,
+                    chunk_size=state.config.chunk_size,
+                ))
+            except ApiError as ex:
+                feed.post_ui(f"start capture failed: {ex.message}")
+                st.error(f"Failed to start capture: {ex.message}")
+            except Exception as ex:
+                st.error(f"Failed to start capture: {ex}")
+            else:
+                st.rerun()
 
     # --- Log Output (full width) ---
     st.subheader("Log Output")
-    log_area("cap_log_area", state.log_lines)
+    _log_output_fragment()
 
-    if state.sessions:
-        time.sleep(0.5)
-        st.rerun()
+    # Keep the page in sync with API-driven changes (change-triggered rerun —
+    # a quiet backend never disturbs the form).
+    _watch_backend_fragment()

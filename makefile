@@ -2,6 +2,11 @@
 all: bin
 
 bin: build
+#	Build the client wheel and install it over the editable install so the
+#	frozen binary uses (and proves) the real wheel
+	rm -rf lib/dist
+	venv/bin/python -m build --wheel lib
+	venv/bin/pip install --force-reinstall lib/dist/*.whl
 	venv/bin/pyinstaller installer.spec --clean
 
 build: src/bin/agent venv/touchfile
@@ -23,8 +28,8 @@ venv/touchfile: requirements-src.txt
 	venv/bin/pip install -Ur requirements-src.txt
 #	Signal that venv has been updated due to pyproject.toml change
 	touch venv/touchfile
-#	Update requirements.txt
-	venv/bin/pip freeze > requirements.txt
+#	Update requirements.txt (exclude the editable lib install - machine-specific path)
+	venv/bin/pip freeze --exclude mtconnect-explorer-client > requirements.txt
 
 src/bin/agent:
 #	Create temporary build directory

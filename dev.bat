@@ -44,7 +44,8 @@ echo Updating venv...
     pause
     exit /b %ERRORLEVEL%
 )
-.\venv\Scripts\pip.exe freeze > requirements.txt
+:: Exclude the editable lib install - its machine-specific path doesn't belong in the lockfile
+.\venv\Scripts\pip.exe freeze --exclude mtconnect-explorer-client > requirements.txt
 echo Updated venv
 
 echo Dev completed successfully

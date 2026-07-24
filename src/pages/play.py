@@ -1,113 +1,23 @@
-import logging
-import threading
-import time
-from typing import List, Optional
+from typing import List
 
 import pandas as pd
 import streamlit as st
 
-from src.agent import Agent, AgentConfig, AgentAdapter
-from src.converter import MtConnectDatasetPlayer, XmlToShdrConverter
+from mtconnect_explorer_client import ApiError
+from mtconnect_explorer_client.schemas import (
+    AgentSettings,
+    PlayCreate,
+    PlayDevice,
+)
+
+from src.pages.api import get_client, get_feed
 from src.pages.core import (
-    DATASETS_DIR,
     PlayConfig,
-    PlayDeviceAdapter,
-    PlaybackSession,
-    PlayPageState,
     agent_url,
-    all_used_ports,
-    attach_session_log,
-    detach_log,
-    drain,
-    get_capture_state,
     get_play_state,
     get_state_lock,
     log_area,
-    session_thread_name,
 )
-
-
-def _play_worker(
-    play_config: PlayConfig,
-    dataset_path: str,
-    stop_event: threading.Event,
-    started_event: threading.Event,
-    log_label: str,
-) -> None:
-    _log = logging.getLogger(__name__)
-    agent: Optional[Agent] = None
-    players: List[MtConnectDatasetPlayer] = []
-    try:
-        _log.info("starting agent...")
-
-        # One agent fronting one SHDR adapter per selected device.
-        agent = Agent(AgentConfig(
-            adapters=[
-                AgentAdapter(name=d.device_name, host=d.player_host, port=d.player_port)
-                for d in play_config.devices
-            ],
-            port=play_config.agent_port,
-            mtconnect_version=play_config.mtconnect_version,
-            asset_buffer_size=play_config.asset_buffer_size,
-            buffer_size=play_config.buffer_size,
-        )).start()
-
-        _log.info("starting %d adapter(s)...", len(play_config.devices))
-
-        # Each player binds its own SHDR adapter (autoplay deferred) and reads the
-        # same dataset file through its own handle, filtered to its device.
-        for d in play_config.devices:
-            players.append(MtConnectDatasetPlayer(
-                d.player_host,
-                d.player_port,
-                play_config.re_timestamp,
-                play_config.loop,
-                thread_name=session_thread_name(log_label, f"dataset-player-{d.device_name}"),
-            ).open(dataset_path, d.device_name, False))
-
-        _log.info("waiting for agent to connect to all adapters...")
-        while not all(p._adapter.agent_is_connected for p in players):
-            if stop_event.is_set():
-                _log.info("playback aborted")
-                return
-            time.sleep(0.1)
-        for p in players:
-            p.play()
-        # The agent has connected to every adapter and data is now streaming;
-        # flip the session status from "starting" to playing.
-        started_event.set()
-
-        _log.info("playback started")
-
-        while not all(p.is_finished for p in players):
-            if stop_event.is_set():
-                break
-            time.sleep(0.1)
-
-        if not stop_event.is_set():
-            _log.info("playback complete")
-        else:
-            _log.info("playback stopped")
-
-    except Exception as ex:
-        _log.error(f"play worker error: {ex}")
-    finally:
-        for p in players:
-            try:
-                p.stop()
-            except Exception:
-                pass
-        try:
-            if agent is not None:
-                agent.stop()
-        except Exception:
-            pass
-
-
-def _session_label(dataset_file: str, device_names: List[str], agent_port: int) -> str:
-    """Human-readable session label used to tag log lines and label the grid."""
-    devices = ", ".join(device_names) if device_names else "no devices"
-    return f"{dataset_file} | {devices} | localhost:{agent_port}"
 
 
 def _next_free_port(start: int, used: set) -> int:
@@ -117,56 +27,67 @@ def _next_free_port(start: int, used: set) -> int:
     return p
 
 
-def _used_ports(state: PlayPageState) -> set:
-    # Ports are de-conflicted across BOTH Play and Simulator sessions so a
-    # playback and a simulation can never collide on the same agent/SHDR port.
-    return all_used_ports()
+def _backend_fingerprint() -> tuple:
+    """What this page renders from the backend: play sessions (id, status),
+    the dataset names + in-use statuses (drives the file selector), and the
+    used-port set (drives the port suggestions/validation)."""
+    client = get_client()
+    return (
+        tuple(sorted((s.id, s.status) for s in client.play_list())),
+        tuple(sorted((d.name, tuple(d.in_use)) for d in client.datasets_list())),
+        tuple(sorted(client.ports().used)),
+    )
 
 
-def _sync_log_handler(state: PlayPageState) -> None:
-    """Detach the consolidated log handler once no sessions remain. Caller holds the lock."""
-    if not state.sessions and state.handler is not None:
-        detach_log(state.handler)
-        state.handler = None
-
-
-def _remove_session(state: PlayPageState, sid: str) -> None:
-    """Signal a session's worker to stop, wait briefly, and drop it. Caller holds the lock."""
-    sess = state.sessions.get(sid)
-    if sess is None:
+@st.fragment(run_every=1.0)
+def _watch_backend_fragment() -> None:
+    """The API can change sessions/datasets behind this page's back — poll the
+    backend and trigger a full-page rerun only when what the page rendered has
+    actually changed, so idle pages pick up API-driven starts/stops without
+    constant rerun churn."""
+    try:
+        current = _backend_fingerprint()
+    except ApiError:
         return
-    if sess.stop_event is not None:
-        sess.stop_event.set()
-    worker = sess.worker
-    if worker is not None and worker.is_alive():
-        worker.join(timeout=15)
-    state.sessions.pop(sid, None)
-    _sync_log_handler(state)
+    if current != st.session_state.get("play_backend_fp"):
+        st.rerun(scope="app")
 
 
-def _reap_finished(state: PlayPageState) -> None:
-    """Drop sessions whose worker exited on its own (e.g. loop disabled, completed).
-    Caller holds the lock."""
-    for sid, sess in list(state.sessions.items()):
-        worker = sess.worker
-        if worker is None or not worker.is_alive():
-            if worker is not None:
-                worker.join(timeout=1)
-            state.sessions.pop(sid, None)
-    _sync_log_handler(state)
+@st.fragment(run_every=0.5)
+def _log_output_fragment() -> None:
+    """Live-refresh the consolidated log via a fragment (partial) rerun."""
+    log_area("play_log_area", get_feed("play").lines)
 
 
 def play_page() -> None:
     st.set_page_config(page_title="MTConnectExplorer", layout="wide")
     st.title("Play")
 
+    client = get_client()
+    feed = get_feed("play")
     state = get_play_state()
 
-    drain(state.log_q, state.log_lines)
-
-    # Reap sessions whose worker has finished/died so the grid stays accurate.
-    with get_state_lock():
-        _reap_finished(state)
+    # Auto-delete terminal sessions (finished/error) so the grid reaps
+    # instantly, exactly like the pre-API behavior (e.g. loop-off completion).
+    sessions = []
+    try:
+        for sess in client.play_list():
+            if sess.status in ("finished", "error"):
+                try:
+                    client.play_stop(sess.id)
+                except ApiError:
+                    pass
+            else:
+                sessions.append(sess)
+    except ApiError as ex:
+        st.error(f"API error: {ex.message}")
+    feed.update_labels(sessions)
+    # Snapshot what this render is based on; the watcher fragment reruns the
+    # page when the backend diverges from it (e.g. API-driven start/stop).
+    try:
+        st.session_state["play_backend_fp"] = _backend_fingerprint()
+    except ApiError:
+        pass
 
     play_config: PlayConfig = state.config
 
@@ -178,15 +99,16 @@ def play_page() -> None:
     form_container = st.container()
 
     # --- Now Playing ---
-    if state.sessions:
+    if sessions:
         with now_playing_container:
             head_l, head_r = st.columns([3, 1])
             head_l.subheader("Now Playing")
             with head_r:
                 if st.button("Stop All", width="stretch"):
-                    with get_state_lock():
-                        for sid in list(state.sessions):
-                            _remove_session(state, sid)
+                    try:
+                        client.play_stop_all()
+                    except ApiError as ex:
+                        feed.post_ui(f"stop all failed: {ex.message}")
                     st.rerun()
 
             h = st.columns([3, 2, 3, 2, 1])
@@ -195,26 +117,25 @@ def play_page() -> None:
             h[2].markdown("**Agent URL**")
             h[3].markdown("**Status**")
             h[4].markdown("**Stop**")
-            for sid, sess in list(state.sessions.items()):
+            for sess in sessions:
                 c = st.columns([3, 2, 3, 2, 1])
-                c[0].write(sess.dataset_file)
+                c[0].write(sess.config.dataset)
                 c[1].write(", ".join(d.device_name for d in sess.config.devices))
-                c[2].write(agent_url(sess.config.agent_port))
-                alive = sess.worker is not None and sess.worker.is_alive()
-                started_ev = getattr(sess, "started", None)
-                started = started_ev is not None and started_ev.is_set()
-                if not alive:
-                    status = "stopping"
-                elif not started:
+                c[2].write(agent_url(sess.config.agent.port))
+                if sess.status == "running":
+                    status = "looping" if sess.config.loop else "playing"
+                elif sess.status == "starting":
                     # Agent still booting / connecting to the SHDR adapter(s).
                     status = "starting"
                 else:
-                    status = "looping" if sess.config.loop else "playing"
+                    status = "stopping"
                 c[3].write(status)
                 with c[4]:
-                    if st.button("Stop", key=f"play_stop_{sid}", width="stretch"):
-                        with get_state_lock():
-                            _remove_session(state, sid)
+                    if st.button("Stop", key=f"play_stop_{sess.id}", width="stretch"):
+                        try:
+                            client.play_stop(sess.id)
+                        except ApiError as ex:
+                            feed.post_ui(f"stop failed: {ex.message}")
                         st.rerun()
             st.divider()
 
@@ -222,11 +143,14 @@ def play_page() -> None:
     _, form_col, _ = form_container.columns([1, 2, 1])
     with form_col:
         st.subheader("Start Playback")
-        DATASETS_DIR.mkdir(exist_ok=True)
         # Exclude datasets that are currently being written by a capture session.
-        capturing = {s.filename for s in get_capture_state().sessions.values()}
-        files = sorted(DATASETS_DIR.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
-        file_names = [f.name for f in files if f.name not in capturing]
+        try:
+            file_names = [
+                d.name for d in client.datasets_list() if "capture" not in d.in_use
+            ]
+        except ApiError as ex:
+            st.error(f"API error: {ex.message}")
+            file_names = []
         if not file_names:
             st.warning("No datasets found. Use the Capture page to record one first.")
 
@@ -238,15 +162,17 @@ def play_page() -> None:
             filter_mode=None,  # Disable search/text input
         )
 
-        # Load device names from selected dataset
+        # Load device names from selected dataset (filtering out the Agent
+        # device is a frontend concern — the endpoint returns all devices).
         device_names: List[str] = []
         if file_names and dataset_file and dataset_file != "(none)":
             try:
                 device_names = sorted(
-                    n for n in XmlToShdrConverter.get_device_names(str(DATASETS_DIR / dataset_file))
-                    if n != "Agent"
+                    d.name
+                    for d in client.datasets_devices(str(dataset_file)).devices
+                    if d.name != "Agent"
                 )
-            except Exception:
+            except ApiError:
                 device_names = []
 
         re_timestamp = st.checkbox(
@@ -267,31 +193,40 @@ def play_page() -> None:
         )
 
         # Ports must be unique across simultaneously-running Play/Simulator
-        # sessions. Pre-fill free ports but let the user override; widget keys embed
-        # the session counter so they re-seed to the next free ports after each
-        # launch while still persisting manual edits between launches.
-        used_ports = _used_ports(state)
-        suggested_agent = _next_free_port(PlayConfig.model_fields["agent_port"].default, used_ports)
-        gen = state.next_id
+        # sessions. Pre-fill free ports (from the backend's suggestions) but let
+        # the user override; widget keys embed a generation counter so they
+        # re-seed to the next free ports after each launch while still
+        # persisting manual edits between launches.
+        try:
+            ports_info = client.ports(shdr_count=len(device_names))
+            used_ports = set(ports_info.used)
+            suggested_agent = ports_info.suggested.agent
+            suggested_shdr = ports_info.suggested.shdr
+        except ApiError:
+            used_ports = set()
+            suggested_agent = PlayConfig.model_fields["agent_port"].default
+            suggested_shdr = []
+        gen = state.gen
 
         # --- Devices: one selectable SHDR adapter per device in the dataset ---
         st.subheader("Devices")
-        default_host = AgentAdapter.model_fields["host"].default
-        # Seed each device a distinct free SHDR port (skipping ports already in use
-        # and those just assigned to earlier rows).
-        seeded = set(used_ports)
+        default_host = PlayDevice.model_fields["shdr_host"].default
         seed_rows = []
-        next_port = AgentAdapter.model_fields["port"].default
-        for name in device_names:
-            next_port = _next_free_port(next_port, seeded)
-            seeded.add(next_port)
+        for i, name in enumerate(device_names):
+            port = (
+                suggested_shdr[i]
+                if i < len(suggested_shdr)
+                else _next_free_port(
+                    PlayDevice.model_fields["shdr_port"].default,
+                    used_ports | set(suggested_shdr),
+                )
+            )
             seed_rows.append({
                 "Enabled": True,
                 "Device": name,
                 "SHDR Adapter Host": default_host,
-                "SHDR Adapter Port": next_port,
+                "SHDR Adapter Port": port,
             })
-            next_port += 1
 
         devices_df = None
         if device_names:
@@ -315,14 +250,14 @@ def play_page() -> None:
             )
 
         # Enabled rows -> the adapters this session will spin up.
-        selected: List[PlayDeviceAdapter] = []
+        selected: List[PlayDevice] = []
         if devices_df is not None:
             for _, row in devices_df.iterrows():
                 if bool(row["Enabled"]):
-                    selected.append(PlayDeviceAdapter(
+                    selected.append(PlayDevice(
                         device_name=str(row["Device"]),
-                        player_host=str(row["SHDR Adapter Host"]).strip(),
-                        player_port=int(row["SHDR Adapter Port"]),
+                        shdr_host=str(row["SHDR Adapter Host"]).strip(),
+                        shdr_port=int(row["SHDR Adapter Port"]),
                     ))
 
         # --- Agent config ---
@@ -347,7 +282,8 @@ def play_page() -> None:
                 key="play_buf_size",
             )
 
-        # Validate ports; disable Play until valid.
+        # Validate ports client-side for instant feedback; the backend
+        # re-validates atomically on POST and is the real gate.
         agent_port = int(agent_port)
         conflicts: List[str] = []
         if not selected:
@@ -356,11 +292,11 @@ def play_page() -> None:
             conflicts.append(f"agent port {agent_port} is in use")
         seen_ports: dict = {}
         for d in selected:
-            if d.player_port == agent_port:
-                conflicts.append(f"{d.device_name}: SHDR port {d.player_port} equals the agent port")
-            if d.player_port in used_ports:
-                conflicts.append(f"{d.device_name}: SHDR port {d.player_port} is in use")
-            seen_ports.setdefault(d.player_port, []).append(d.device_name)
+            if d.shdr_port == agent_port:
+                conflicts.append(f"{d.device_name}: SHDR port {d.shdr_port} equals the agent port")
+            if d.shdr_port in used_ports:
+                conflicts.append(f"{d.device_name}: SHDR port {d.shdr_port} is in use")
+            seen_ports.setdefault(d.shdr_port, []).append(d.device_name)
         for port, names in seen_ports.items():
             if len(names) > 1:
                 conflicts.append(f"SHDR port {port} reused by {', '.join(names)}")
@@ -376,58 +312,43 @@ def play_page() -> None:
         )
 
         if play_clicked and file_names and selected:
-            with get_state_lock():
-                # Re-validate under the lock — another user may have taken a port.
-                used_now = _used_ports(state)
-                clashing = [d.device_name for d in selected if d.player_port in used_now]
-                if agent_port in used_now or clashing:
+            try:
+                client.play_start(PlayCreate(
+                    dataset=str(dataset_file),
+                    devices=selected,
+                    agent=AgentSettings(
+                        port=agent_port,
+                        mtconnect_version=str(mtc_version),
+                        asset_buffer_size=int(asset_buf),
+                        buffer_size=int(buf_size),
+                    ),
+                    re_timestamp=bool(re_timestamp),
+                    loop=bool(loop),
+                ))
+            except ApiError as ex:
+                if ex.code == "port_conflict":
                     st.warning("Those ports were just taken by another session. Adjust and retry.")
                 else:
-                    final_config = PlayConfig(
+                    feed.post_ui(f"start playback failed: {ex.message}")
+                    st.error(f"Failed to start playback: {ex.message}")
+            else:
+                # Remember non-device settings as defaults for the next launch.
+                with get_state_lock():
+                    state.config = PlayConfig(
                         agent_port=agent_port,
                         mtconnect_version=str(mtc_version),
                         asset_buffer_size=int(asset_buf),
                         buffer_size=int(buf_size),
                         re_timestamp=bool(re_timestamp),
                         loop=bool(loop),
-                        devices=selected,
                     )
-                    # Remember non-device settings as defaults for the next launch.
-                    state.config = final_config
-
-                    sid = str(state.next_id)
-                    state.next_id += 1
-                    device_names_sel = [d.device_name for d in selected]
-                    label = _session_label(str(dataset_file), device_names_sel, agent_port)
-
-                    if state.handler is None:
-                        state.handler = attach_session_log(state.log_q, state.sessions)
-
-                    stop_event = threading.Event()
-                    started_event = threading.Event()
-                    worker = threading.Thread(
-                        target=_play_worker,
-                        args=(final_config, str(DATASETS_DIR / dataset_file),
-                              stop_event, started_event, label),
-                        name=session_thread_name(label, "worker"),
-                        daemon=True,
-                    )
-                    state.sessions[sid] = PlaybackSession(
-                        id=sid,
-                        label=label,
-                        dataset_file=str(dataset_file),
-                        config=final_config,
-                        worker=worker,
-                        stop_event=stop_event,
-                        started=started_event,
-                    )
-                    worker.start()
-                    st.rerun()
+                    state.gen += 1
+                st.rerun()
 
     # --- Log Output (full width) ---
     st.subheader("Log Output")
-    log_area("play_log_area", state.log_lines)
+    _log_output_fragment()
 
-    if state.sessions:
-        time.sleep(0.5)
-        st.rerun()
+    # Keep the page in sync with API-driven changes (change-triggered rerun —
+    # a quiet backend never disturbs the form or an in-progress device edit).
+    _watch_backend_fragment()

@@ -4,3 +4,9 @@ pydantic
 psutil
 streamlit
 streamlit-tree-select
+
+fastapi
+build
+pytest
+
+-e ./lib
