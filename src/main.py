@@ -84,8 +84,9 @@ def _run_server(host: str, port: int) -> None:
     if exposed and not config.api_key:
         print(
             f"Error: refusing to bind '{host}' without an API key.\n"
-            "Exposing the server requires an 'api_key' field in config.json "
-            "so the HTTP API is not open to the network unauthenticated.",
+            "Set an 'api_key' in config.json before binding beyond localhost. "
+            "(It gates the /api endpoints; the UI itself has no authentication, "
+            "so only ever run this on a trusted LAN, never the internet.)",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -116,8 +117,11 @@ def _run_server(host: str, port: int) -> None:
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
     # Print our own startup banner (Streamlit's is suppressed above), reusing
-    # Streamlit's URL helpers so the URLs match its output. Network/External
-    # URLs are only meaningful (and only printed) when actually exposed.
+    # Streamlit's URL helpers so the URLs match its output. Only the LAN
+    # (Network) URL is shown when exposed — the public-IP "External" URL is
+    # deliberately omitted: this app has no UI authentication and is for
+    # trusted-LAN use only, so advertising an internet-facing URL would invite
+    # exactly the deployment the warning below tells you not to do.
     from streamlit import net_util
     from streamlit.web.server import server_util
     print(f"  Open MTConnectExplorer v{__version__} in your browser:")
@@ -126,10 +130,17 @@ def _run_server(host: str, port: int) -> None:
         internal_ip = net_util.get_internal_ip()
         if internal_ip:
             print(f"    Network URL: {server_util.get_url(internal_ip)}")
-        external_ip = net_util.get_external_ip()
-        if external_ip:
-            print(f"    External URL: {server_util.get_url(external_ip)}")
     print(f"    API Docs:  {server_util.get_url('localhost')}/api/docs")
+    print()
+    if exposed:
+        print(f"  WARNING: bound to {host} - reachable by other machines on the network,")
+        print("  and the UI has no authentication. Use only on a trusted LAN; never")
+        print("  expose this app to the internet.")
+    else:
+        print(f"  Bound to {host} (this machine only). To reach it from other machines on")
+        print("  a trusted LAN, launch with --host 0.0.0.0 (requires an 'api_key' in")
+        print("  config.json). This app has no UI authentication; never expose it to the")
+        print("  internet.")
     print()
 
     app = App(

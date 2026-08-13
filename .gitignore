@@ -1,6 +1,6 @@
 __pycache__/
-CLAUDE.md
-.claude/
+.pytest_cache/
+.claude/*.local.json
 build/
 datasets/
 dist/

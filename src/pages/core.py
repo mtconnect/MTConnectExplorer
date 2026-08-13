@@ -13,7 +13,7 @@ from typing import List, Optional
 import streamlit as st
 from pydantic import BaseModel, ConfigDict, Field
 
-from mtconnect_explorer_client.schemas import AgentSettings, CaptureCreate, ShdrSettings
+from mtconnect_explorer_client.schemas import AgentSettings, CaptureCreate, PlayCreate, ShdrSettings
 
 from src.client import MtConnectExplorer
 
@@ -232,6 +232,10 @@ class PlayConfig(BaseModel):
     loop: bool = Field(
         True,
         description="Repeat playback from the start once the dataset is exhausted",
+    )
+    snapshot_interval_s: float = Field(
+        PlayCreate.model_fields["snapshot_interval_s"].default,
+        description="Seek keyframe cadence (dataset seconds) for the scrub index",
     )
 
 

@@ -39,6 +39,17 @@ process as the Streamlit UI (UI at `/`, API at `/api`, interactive docs at
 
 ## 2. Authentication
 
+> **Deployment posture: trusted LAN only — never the internet.** The `api_key`
+> below gates the `/api` endpoints, **not the Streamlit UI**, which has no
+> authentication at all. The UI drives the same backend (via the runtime
+> token), so anyone who can reach an exposed instance can operate it regardless
+> of the key. The refuse-to-start guard forces a key when binding beyond
+> localhost, but that hardens only the direct-API surface — it does not make an
+> internet-facing deployment safe. One key sharp edge: Capture issues HTTP
+> requests to an arbitrary operator-supplied `base_url` server-side (an SSRF
+> primitive on an exposed host). Run this only on a network where every machine
+> that can reach it is trusted.
+
 - **Static key** — `api_key` field in `config.json` (JSONC). For external
   clients and any future remote UI.
 - **Runtime token** — generated at startup, handed to the in-process Streamlit
@@ -290,6 +301,32 @@ Validation (all-or-nothing, under the manager lock): dataset exists
 (`404`), dataset not being captured (`409 dataset_in_use`), ≥1 device
 (`422`), all ports free and mutually distinct (`409 port_conflict` with the
 full conflict list, mirroring today's inline messages).
+
+#### Playback control (running sessions)
+
+| Endpoint | Effect |
+|---|---|
+| `GET /api/v1/play/sessions/{id}/progress` | Scrub-bar origin: `duration`, `pass_start_epoch`, `looping`, `paused`, `position`, `server_time`. The UI computes the live playhead as `server_time − pass_start_epoch`; while `paused` is true it holds the playhead at `position` instead (the origin stops advancing). |
+| `POST /api/v1/play/sessions/{id}/seek` | Body `{"position": <sec>}`. Seek a running playback. Requires re-timestamp mode (`409 seek_unavailable` otherwise); `404`/`409 not_running` as applicable. `204`. |
+| `POST /api/v1/play/sessions/{id}/pause` | Freeze the playhead target (stops it advancing). Works in **any** timestamp mode — unlike seek it does not rewind or re-order data. `409 not_running` if not running. `204`. |
+| `POST /api/v1/play/sessions/{id}/resume` | Resume a paused playback. `409 not_running` if not running. `204`. |
+
+Pause/resume ride the same worker command channel as seek. The player models a
+**playhead target** (advances at 1× wall-clock while playing, frozen while paused,
+set directly by a seek) separate from the **emit cursor** (how far data has been
+released): frames emit while their time ≤ target — unpaced when behind (a post-seek
+catch-up), paced when caught up. So **pause never blocks the emit loop** — a
+post-seek fast-forward runs to the (frozen) target and then idles. The emit-timestamp
+clock is kept separate and monotonic so a backward seek/loop-wrap never emits a
+decreasing timestamp.
+
+**Seek uses a keyframe index.** `snapshot_interval_s` on `PlayCreate` (default `15`,
+fixed once playing) sets how often — in dataset seconds — a full-state snapshot
+(a `/current` equivalent, folded from the recording) is indexed at load, together
+with the byte offset of the frame that follows it. A seek jumps to the nearest
+snapshot ≤ the target, emits that state, and replays only the ≤ `snapshot_interval_s`
+of deltas up to the target — instead of replaying from the start of the recording.
+Smaller intervals mean faster seeks but more memory and a longer one-time pre-scan.
 
 ### Simulate
 

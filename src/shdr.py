@@ -275,8 +275,23 @@ class ShdrAdapter:
         """Bind the port, start listening, and begin accepting agent connections."""
         self._running = True
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server_sock.bind((self.configuration.host, self.configuration.port))
+        # SO_REUSEADDR only on POSIX. There it merely bypasses TIME_WAIT on rebind
+        # and does NOT permit two live listeners on one port (that needs
+        # SO_REUSEPORT), so it's safe and desirable. On Windows, SO_REUSEADDR lets a
+        # SECOND socket bind a port a live listener already holds — a silent
+        # double-bind where the agent may connect to a stale/orphaned adapter
+        # instead of ours. Windows doesn't need it for restart (verified), so omit
+        # it there and let a duplicate bind fail fast with WSAEADDRINUSE below.
+        if os.name != "nt":
+            self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self._server_sock.bind((self.configuration.host, self.configuration.port))
+        except OSError as exc:
+            raise OSError(
+                f"SHDR adapter for device '{self.configuration.device}' could not bind "
+                f"{self.configuration.host}:{self.configuration.port} — the port is already "
+                f"in use (a previous session's adapter may still be running): {exc}"
+            ) from exc
         self._server_sock.listen(5)
         self._server_thread = threading.Thread(
             target=self._accept_loop,
@@ -357,7 +372,10 @@ class ShdrAdapter:
                 conn, addr = self._server_sock.accept()
             except OSError:
                 break
-            logger.debug("Agent connected from %s", addr)
+            logger.debug(
+                "Agent connected to adapter '%s' from %s",
+                self.configuration.device, addr,
+            )
             self._handshake(conn)
             t = threading.Thread(
                 target=self._read_loop,

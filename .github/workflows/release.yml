@@ -103,7 +103,7 @@ jobs:
       - name: Build with make
         run: make
       - name: Generate third-party notices
-        run: venv/bin/python generate_notices.py THIRD_PARTY_NOTICES.txt
+        run: venv/bin/python packaging/generate_notices.py THIRD_PARTY_NOTICES.txt
       - name: Package tar.gz
         run: |
           test -f dist/MTConnectExplorer
@@ -132,7 +132,7 @@ jobs:
         run: build.bat ci
       - name: Generate third-party notices
         shell: cmd
-        run: venv\Scripts\python.exe generate_notices.py THIRD_PARTY_NOTICES.txt
+        run: venv\Scripts\python.exe packaging\generate_notices.py THIRD_PARTY_NOTICES.txt
       - name: Package zip
         shell: pwsh
         run: |

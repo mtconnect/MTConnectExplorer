@@ -4,7 +4,14 @@ from typing import List
 
 from fastapi import APIRouter, Depends
 
-from mtconnect_explorer_client.schemas import PlayCreate, PlaySessionInfo
+from datetime import datetime, timezone
+
+from mtconnect_explorer_client.schemas import (
+    PlayCreate,
+    PlayProgress,
+    PlaySeek,
+    PlaySessionInfo,
+)
 
 from src.services.play import play_manager
 
@@ -43,6 +50,51 @@ def list_sessions() -> List[PlaySessionInfo]:
 )
 def get_session(session_id: str) -> PlaySessionInfo:
     return play_manager.get_info(session_id)
+
+
+@router.get(
+    "/sessions/{session_id}/progress",
+    summary="Playhead origin for the scrub bar (duration + pass_start_epoch)",
+    response_model=PlayProgress,
+)
+def progress(session_id: str) -> PlayProgress:
+    sess = play_manager.get(session_id)
+    p = play_manager.progress_of(sess)
+    return PlayProgress(
+        duration=p["duration"] or 0.0,
+        pass_start_epoch=p["pass_start_epoch"],
+        looping=p["looping"],
+        paused=p.get("paused", False),
+        position=p.get("position"),
+        server_time=datetime.now(timezone.utc),
+    )
+
+
+@router.post(
+    "/sessions/{session_id}/seek",
+    summary="Seek a running playback to a position (requires re-timestamp mode)",
+    status_code=204,
+)
+def seek(session_id: str, body: PlaySeek) -> None:
+    play_manager.seek(session_id, body.position)
+
+
+@router.post(
+    "/sessions/{session_id}/pause",
+    summary="Pause a running playback (holds the playhead; any timestamp mode)",
+    status_code=204,
+)
+def pause(session_id: str) -> None:
+    play_manager.pause(session_id)
+
+
+@router.post(
+    "/sessions/{session_id}/resume",
+    summary="Resume a paused playback",
+    status_code=204,
+)
+def resume(session_id: str) -> None:
+    play_manager.resume(session_id)
 
 
 @router.delete(

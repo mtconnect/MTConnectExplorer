@@ -10,14 +10,18 @@ self-exec subprocesses (``SubprocessHost``) without changing any API behavior.
 flag (``MTConnectExplorer --worker <kind>`` when frozen,
 ``python -m src --worker <kind>`` in dev — dispatched in main.py before any
 streamlit import). Protocol: the worker config is one JSON line on stdin;
-``{"cmd": "stop"}`` on stdin (or stdin EOF — orphan protection) requests a
-graceful stop; the child emits NDJSON on stdout (``status`` / ``log`` /
-``exit`` records) which the parent's reader thread forwards to the manager and
-the event bus. See src/services/worker_main.py for the child side.
+further ``{"cmd": ...}`` lines on stdin deliver commands to the running worker —
+``{"cmd": "stop"}`` (or stdin EOF — orphan protection) requests a graceful stop,
+and any other command (e.g. ``{"cmd": "seek", "position": ...}``) is delivered
+to the worker via its context command channel. The child emits NDJSON on stdout
+(``status`` / ``log`` / ``exit`` records) which the parent's reader thread
+forwards to the manager and the event bus. See src/services/worker_main.py for
+the child side.
 """
 
 import json
 import logging
+import queue
 import subprocess
 import sys
 import threading
@@ -44,17 +48,31 @@ def register_worker(
 
 
 class WorkerContext:
-    """What a worker gets from its manager: a stop signal and a status channel."""
+    """What a worker gets from its manager: a stop signal, a status channel, and
+    an inbound command channel."""
 
     def __init__(
         self,
         stop_event: threading.Event,
         set_status: Callable[..., None],
+        commands: Optional["queue.Queue"] = None,
     ) -> None:
         self.stop_event = stop_event
         # set_status(status, *, error=None, detail=None) — reports lifecycle
         # transitions (typically just "running") back to the owning manager.
         self.set_status = set_status
+        # Inbound command channel — dicts like {"cmd": "seek", "position": ...}.
+        # Unlike the one-shot stop_event, commands carry a payload and repeat.
+        # ThreadHost shares this queue with the handle (in-process); Subprocess
+        # workers get a child-local queue fed by their stdin reader.
+        self.commands: "queue.Queue" = commands if commands is not None else queue.Queue()
+
+    def poll_command(self) -> Optional[Dict[str, Any]]:
+        """Return the next pending command, or None (non-blocking)."""
+        try:
+            return self.commands.get_nowait()
+        except queue.Empty:
+            return None
 
 
 class WorkerHandle:
@@ -64,6 +82,10 @@ class WorkerHandle:
         raise NotImplementedError
 
     def join(self, timeout: Optional[float] = None) -> None:
+        raise NotImplementedError
+
+    def send_command(self, cmd: Dict[str, Any]) -> None:
+        """Deliver a command dict to the running worker (see WorkerContext.commands)."""
         raise NotImplementedError
 
 
@@ -88,14 +110,19 @@ class WorkerHost:
 # ThreadHost — daemon threads in this process
 # ---------------------------------------------------------------------------
 class _ThreadHandle(WorkerHandle):
-    def __init__(self, thread: threading.Thread) -> None:
+    def __init__(self, thread: threading.Thread, commands: "queue.Queue") -> None:
         self._thread = thread
+        self._commands = commands
 
     def is_alive(self) -> bool:
         return self._thread.is_alive()
 
     def join(self, timeout: Optional[float] = None) -> None:
         self._thread.join(timeout)
+
+    def send_command(self, cmd: Dict[str, Any]) -> None:
+        # Same in-process queue the worker's ctx polls.
+        self._commands.put(cmd)
 
 
 class ThreadHost(WorkerHost):
@@ -123,7 +150,7 @@ class ThreadHost(WorkerHost):
 
         thread = threading.Thread(target=_run, name=thread_name, daemon=True)
         thread.start()
-        return _ThreadHandle(thread)
+        return _ThreadHandle(thread, ctx.commands)
 
 
 # ---------------------------------------------------------------------------
@@ -136,11 +163,23 @@ def _worker_argv(kind: str) -> list:
 
 
 class _ProcessHandle(WorkerHandle):
-    def __init__(self, proc: subprocess.Popen) -> None:
+    def __init__(self, proc: subprocess.Popen, stdin_lock: threading.Lock) -> None:
         self._proc = proc
+        self._stdin_lock = stdin_lock
 
     def is_alive(self) -> bool:
         return self._proc.poll() is None
+
+    def send_command(self, cmd: Dict[str, Any]) -> None:
+        # Deliver as a stdin NDJSON line; the child's stdin reader dispatches it
+        # onto the worker's command queue. Serialized against the stop-writer
+        # (both target proc.stdin).
+        with self._stdin_lock:
+            try:
+                self._proc.stdin.write(json.dumps(cmd) + "\n")
+                self._proc.stdin.flush()
+            except Exception:
+                pass  # child already gone
 
     def join(self, timeout: Optional[float] = None) -> None:
         """Wait for exit; escalate terminate -> kill rather than leak a
@@ -188,11 +227,15 @@ class SubprocessHost(WorkerHost):
             encoding="utf-8",
             creationflags=creationflags,
         )
+        # All writes to the child's stdin (config, stop, and commands) go through
+        # this lock so the stop-writer and send_command can't interleave.
+        stdin_lock = threading.Lock()
         # Hand the worker its config as the first stdin line; keep stdin open
-        # for the stop command (and as the orphan-protection lifeline — the
-        # child stops itself on stdin EOF if this process dies).
-        proc.stdin.write(config.model_dump_json() + "\n")
-        proc.stdin.flush()
+        # for commands (and as the orphan-protection lifeline — the child stops
+        # itself on stdin EOF if this process dies).
+        with stdin_lock:
+            proc.stdin.write(config.model_dump_json() + "\n")
+            proc.stdin.flush()
 
         exit_error: Dict[str, Optional[str]] = {"error": None, "seen_exit": None}
 
@@ -250,11 +293,12 @@ class SubprocessHost(WorkerHost):
             # Bridge the manager's in-process stop_event across the process
             # boundary as the graceful {"cmd": "stop"} command.
             ctx.stop_event.wait()
-            try:
-                proc.stdin.write('{"cmd": "stop"}\n')
-                proc.stdin.flush()
-            except Exception:
-                pass  # child already gone
+            with stdin_lock:
+                try:
+                    proc.stdin.write('{"cmd": "stop"}\n')
+                    proc.stdin.flush()
+                except Exception:
+                    pass  # child already gone
 
         threading.Thread(
             target=_read_stdout, name=thread_name, daemon=True
@@ -269,7 +313,7 @@ class SubprocessHost(WorkerHost):
             name=session_thread_name_for(session_id, "worker-stop"),
             daemon=True,
         ).start()
-        return _ProcessHandle(proc)
+        return _ProcessHandle(proc, stdin_lock)
 
 
 def session_thread_name_for(session_id: str, subname: str) -> str:

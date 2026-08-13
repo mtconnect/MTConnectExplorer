@@ -15,7 +15,14 @@ from .common import (
     SessionStatus,
 )
 from .capture import CaptureCreate, CaptureSessionInfo
-from .play import AgentSettings, PlayCreate, PlayDevice, PlaySessionInfo
+from .play import (
+    AgentSettings,
+    PlayCreate,
+    PlayDevice,
+    PlayProgress,
+    PlaySeek,
+    PlaySessionInfo,
+)
 from .simulate import (
     CREATE_MODELS,
     EquipmentInfo,
@@ -48,6 +55,8 @@ __all__ = [
     "AgentSettings",
     "PlayCreate",
     "PlayDevice",
+    "PlayProgress",
+    "PlaySeek",
     "PlaySessionInfo",
     "CREATE_MODELS",
     "EquipmentInfo",

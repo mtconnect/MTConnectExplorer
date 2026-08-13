@@ -94,6 +94,13 @@ def simulate_worker(cfg: SimulateWorkerConfig, ctx: WorkerContext) -> None:
     )
     agent: Optional[Agent] = None
     try:
+        # Adapter up first, then the agent (see play_worker / the CLAUDE.md gotcha:
+        # the bundled agent skips the first-declared adapter if it starts before any
+        # adapter is listening). Only one adapter here, so it's not strictly needed,
+        # but keeping the order consistent future-proofs a multi-adapter simulate.
+        _log.info("starting adapter...")
+        simulator.start()  # binds the SHDR adapter's TCP server
+
         _log.info("starting agent...")
         agent = Agent(AgentConfig(
             adapters=[AgentAdapter(
@@ -106,9 +113,6 @@ def simulate_worker(cfg: SimulateWorkerConfig, ctx: WorkerContext) -> None:
             asset_buffer_size=create.agent.asset_buffer_size,
             buffer_size=create.agent.buffer_size,
         )).start()
-
-        _log.info("starting adapter...")
-        simulator.start()  # binds the SHDR adapter's TCP server
 
         _log.info("waiting for agent to connect to adapter...")
         while not simulator.adapter.agent_is_connected:

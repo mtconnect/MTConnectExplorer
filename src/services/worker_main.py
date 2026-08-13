@@ -15,6 +15,7 @@ before any streamlit import).
 
 import json
 import logging
+import queue
 import signal
 import sys
 import threading
@@ -71,16 +72,22 @@ def run_worker(kind: str) -> int:
     config = config_type.model_validate_json(config_line)
 
     stop_event = threading.Event()
+    commands: "queue.Queue" = queue.Queue()
 
     def _watch_stdin() -> None:
-        # Stop on {"cmd": "stop"} — or on EOF, which means the parent is gone
-        # (orphan protection: tear down our agent instead of lingering).
+        # Dispatch inbound stdin commands. {"cmd": "stop"} (or EOF, meaning the
+        # parent is gone — orphan protection) stops us; every other command is
+        # handed to the worker via its context command queue.
         for line in sys.stdin:
             try:
-                if json.loads(line).get("cmd") == "stop":
-                    break
+                cmd = json.loads(line)
             except ValueError:
                 continue
+            if not isinstance(cmd, dict):
+                continue
+            if cmd.get("cmd") == "stop":
+                break
+            commands.put(cmd)
         stop_event.set()
 
     threading.Thread(target=_watch_stdin, name="stdin-watch", daemon=True).start()
@@ -95,7 +102,7 @@ def run_worker(kind: str) -> int:
 
     error: Optional[str] = None
     try:
-        fn(config, WorkerContext(stop_event=stop_event, set_status=set_status))
+        fn(config, WorkerContext(stop_event=stop_event, set_status=set_status, commands=commands))
     except Exception as ex:
         error = str(ex)
         logging.getLogger(__name__).error(f"{kind} worker error: {ex}")

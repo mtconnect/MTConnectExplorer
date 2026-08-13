@@ -43,7 +43,11 @@ def strip_json_comments(text: str) -> str:
 def load_config(path: Union[str, Path] = "config.json") -> Config:
     """Load config.json (JSONC) if present, else defaults."""
     if os.path.isfile(path):
-        return Config.model_validate_json(strip_json_comments(Path(path).read_text()))
+        # utf-8-sig transparently strips a UTF-8 BOM (Windows editors add one)
+        # and otherwise reads plain UTF-8 — Path.read_text() would use the
+        # locale encoding, which mangles a BOM into an invalid-JSON error.
+        text = Path(path).read_text(encoding="utf-8-sig")
+        return Config.model_validate_json(strip_json_comments(text))
     return Config()
 
 

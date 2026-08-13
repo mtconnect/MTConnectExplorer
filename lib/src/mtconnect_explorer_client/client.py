@@ -28,6 +28,8 @@ from .schemas import (
     EventPage,
     HealthInfo,
     PlayCreate,
+    PlayProgress,
+    PlaySeek,
     PlaySessionInfo,
     PortsInfo,
     RenameRequest,
@@ -192,6 +194,27 @@ class ApiClient:
         return PlaySessionInfo.model_validate(
             self._request("GET", f"/play/sessions/{session_id}").json()
         )
+
+    def play_progress(self, session_id: str) -> PlayProgress:
+        """GET /play/sessions/{id}/progress — the scrub bar's playhead origin."""
+        return PlayProgress.model_validate(
+            self._request("GET", f"/play/sessions/{session_id}/progress").json()
+        )
+
+    def play_seek(self, session_id: str, position: float) -> None:
+        """POST /play/sessions/{id}/seek — seek a running playback (re-timestamp mode)."""
+        self._request(
+            "POST", f"/play/sessions/{session_id}/seek",
+            json=PlaySeek(position=position).model_dump(),
+        )
+
+    def play_pause(self, session_id: str) -> None:
+        """POST /play/sessions/{id}/pause — pause a running playback (any timestamp mode)."""
+        self._request("POST", f"/play/sessions/{session_id}/pause")
+
+    def play_resume(self, session_id: str) -> None:
+        """POST /play/sessions/{id}/resume — resume a paused playback."""
+        self._request("POST", f"/play/sessions/{session_id}/resume")
 
     def play_stop(self, session_id: str) -> None:
         """DELETE /play/sessions/{id} — stop and remove."""

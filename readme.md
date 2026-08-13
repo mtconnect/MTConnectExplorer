@@ -227,9 +227,10 @@ same process as the UI (UI at `/`, API at `/api/v1`, interactive docs at
 
 - **Auth:** send `X-API-Key: <key>` on every request, where `<key>` is the
   `api_key` field in `config.json`. `GET /api/v1/health` needs no key.
-- **Bind address:** the server binds `127.0.0.1` by default; pass
-  `--host <addr>` to expose it. Exposing without an `api_key` configured is
-  refused at startup.
+- **Bind address:** the server binds `127.0.0.1` by default (this machine
+  only); pass `--host 0.0.0.0` to reach it from other machines on your LAN.
+  Binding beyond localhost without an `api_key` configured is refused at
+  startup (the key gates `/api`; see the warning below about the UI).
 - **Events:** `GET /api/v1/events/stream` streams logs and session status
   changes as NDJSON with cursor-based reconnect (see docs/api.md §8).
 

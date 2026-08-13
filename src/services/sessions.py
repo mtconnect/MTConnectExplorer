@@ -204,6 +204,13 @@ class SessionManager:
     def get_info(self, sid: str) -> SessionInfo:
         return self.get(sid).to_info(self.info_model)
 
+    def send_command(self, sid: str, cmd: Dict[str, Any]) -> None:
+        """Deliver a command dict to a running session's worker (e.g. a seek).
+        Raises NotFound for an unknown/purged session."""
+        sess = self.get(sid)
+        if sess.handle is not None:
+            sess.handle.send_command(cmd)
+
     # -- lifecycle -----------------------------------------------------------
     def delete(self, sid: str, join_timeout: float = 15.0) -> None:
         """Stop (signal, join with timeout) and remove the session."""
