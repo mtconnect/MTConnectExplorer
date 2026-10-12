@@ -69,8 +69,21 @@ runs:
         # Assert the archive is real. `tar` exits 0 on an empty input set, so
         # "the command succeeded" is not the same as "an archive was produced".
         [ -s "$archive" ] || { echo "::error::$archive was not produced, or is empty"; exit 1; }
-        tar -tzf "$archive" | grep -qx MTConnectExplorer \
+
+        # ⛔ LIST TO A FILE, THEN GREP THE FILE. Never `tar -tzf … | grep -q`.
+        # `grep -q` exits at the first match and closes the pipe while tar is
+        # still streaming through tens of MB of compressed payload to reach the
+        # next entry; tar's next write gets SIGPIPE ("tar: stdout: write
+        # error"), and under `pipefail` that failure becomes the PIPELINE's
+        # status — so the check reports "binary missing" for an archive that
+        # contains it. Note the shape: it fires only when the check SUCCEEDS,
+        # and only once the payload is big enough to keep tar busy, so a small
+        # synthetic fixture passes and the real build fails. This is the same
+        # defect make_deb.sh hit in the sibling CellSmith repo.
+        tar -tzf "$archive" > .archive-contents.txt
+        grep -qx MTConnectExplorer .archive-contents.txt \
           || { echo "::error::$archive does not contain the MTConnectExplorer binary"; exit 1; }
+        rm -f .archive-contents.txt
 
         ls -la "$archive"
         echo "archive=$archive" >> "$GITHUB_OUTPUT"

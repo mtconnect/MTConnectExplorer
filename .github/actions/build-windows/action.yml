@@ -60,8 +60,14 @@ runs:
 
         # Assert the archive is real, not merely that the cmdlet returned.
         if (-not (Test-Path $env:ARCHIVE)) { throw "$env:ARCHIVE was not produced" }
-        $entries = [IO.Compression.ZipFile]::OpenRead(
-          (Resolve-Path $env:ARCHIVE)).Entries.Name
+
+        # Dispose the handle explicitly: OpenRead holds the file open, and a
+        # leaked handle keeps the .zip locked for the rest of the job — the
+        # upload step would then fail on a file "in use by another process".
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $env:ARCHIVE))
+        try   { $entries = @($zip.Entries.Name) }
+        finally { $zip.Dispose() }
         if ($entries -notcontains 'MTConnectExplorer.exe') {
           throw "$env:ARCHIVE does not contain MTConnectExplorer.exe"
         }
