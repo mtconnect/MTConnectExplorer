@@ -558,17 +558,37 @@ Rationale:
 ### Pre-merge build check (`ci.yml`)
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on **`pull_request` events targeting
-    `main`, `dev/*`, and `release/*`**. It builds the app on both shipped platforms (`build-linux`
-    via `make`, `build-windows` via `build.bat ci`) and fails if the binary isn't produced — catching
-    build, packaging, and import breakage *before* a PR merges. It does **not** package or upload
-    artifacts, and it doesn't run the integration loopback test in [`src/test.py`](src/test.py). It
-    also runs `version-check`, which always validates that `__version__` parses and is semver, and for
-    PRs into `release/*` additionally checks the `X.Y` line against the branch and refuses a version
-    that is already tagged (above). It reads the version through
+    `main`, `dev/*`, and `release/*`**, with four jobs:
+
+| Job | What it does |
+|---|---|
+| `build-linux` | The **complete** Linux release build, via the shared [`build-linux`](.github/actions/build-linux/action.yml) composite action: `make` → binary assertion → third-party notices → `tar.gz` → archive assertions. |
+| `build-windows` | The same for Windows, via [`build-windows`](.github/actions/build-windows/action.yml): `build.bat ci` → `.exe` assertion → notices → `.zip` → archive assertions. |
+| `test` | `pytest tests` against a venv built from `requirements-src.txt`. Tests needing the bundled MTConnect agent binary self-skip when `src/bin/agent` is absent. Not a required status check. |
+| `version-check` | Always validates that `__version__` parses and is semver. For PRs into `main`, `dev/X.Y` *or* `release/X.Y` it also refuses a version that is already released; for `release/*` it additionally checks the `X.Y` line against the branch (above). |
+
+> **⭐ The gate runs the release build, not a cheaper approximation of it.**
+>
+> It used to stop after the binary existed — the third-party notices and the `tar.gz`/`.zip`
+>     packaging were **release-only**. That meant a packaging break was first seen *after* the merge
+>     into `release/X.Y`, when the version is already spent and the fix costs another bump and
+>     another merge. [`packaging/generate_notices.py`](packaging/generate_notices.py) is the live
+>     hazard: it walks installed package metadata, so a new dependency with missing or malformed
+>     metadata breaks it — a change the old gate passed happily.
+>
+> The build now lives in **one composite action per OS**, shared verbatim with `release.yml`; only
+>     the artifact upload is release-specific. Both actions derive the archive name from the same
+>     version reader, so the gate names artifacts exactly as the release will. Cost: the gate is
+>     slower by the packaging time.
+
+`version-check` reads the version through
     [`.github/scripts/read-version.sh`](.github/scripts/read-version.sh) rather than inlining a
-    parse; `release.yml` calls the same script. That is deliberate — the two workflows used to carry
-    their own copy of the parse, and two copies of a parse drift. Required
-    status-check names appear in a ruleset's search box after the workflow has run once on a PR.
+    parse; `release.yml` and both composite actions call the same script. That is deliberate — the
+    two workflows used to carry their own copy of the parse, and two copies of a parse drift.
+    Required status-check names appear in a ruleset's search box after the workflow has run once on
+    a PR.
+
+The gate still does not run the integration loopback test in [`src/test.py`](src/test.py).
 
 The release workflow itself is **not** a required status check: it runs *after* merge (its trigger
     is the resulting push to `release/*`), so it can't be a pre-merge gate — which is exactly why

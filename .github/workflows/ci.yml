@@ -112,31 +112,22 @@ jobs:
       - name: Run pytest
         run: venv/bin/python -m pytest tests -q
 
+  # ⭐ THE GATE RUNS THE RELEASE BUILD, NOT A CHEAPER APPROXIMATION OF IT.
+  # Both jobs below are the SAME composite actions release.yml uses, so the
+  # third-party notices and the tar.gz/zip packaging are exercised on every PR.
+  # They used to be release-only ("the gate just needs to know it compiles"),
+  # which meant a packaging break was first seen after the merge into
+  # release/X.Y — when the version is already spent and the fix costs another
+  # bump. See .github/actions/build-linux/action.yml. Only the artifact upload
+  # is release-specific.
   build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-      - name: Build with make
-        run: make
-      - name: Verify binary was produced
-        run: test -f dist/MTConnectExplorer
+      - uses: ./.github/actions/build-linux
 
   build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-      - name: Build with build.bat
-        shell: cmd
-        run: build.bat ci
-      - name: Verify binary was produced
-        shell: pwsh
-        run: |
-          if (-not (Test-Path dist\MTConnectExplorer.exe)) {
-            throw "dist\MTConnectExplorer.exe not found"
-          }
+      - uses: ./.github/actions/build-windows

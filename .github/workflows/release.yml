@@ -116,58 +116,33 @@ jobs:
     needs: version
     if: needs.version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
-    env:
-      ARCHIVE: MTConnectExplorer-v${{ needs.version.outputs.version }}-linux-x86_64.tar.gz
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-      - name: Build with make
-        run: make
-      - name: Generate third-party notices
-        run: venv/bin/python packaging/generate_notices.py THIRD_PARTY_NOTICES.txt
-      - name: Package tar.gz
-        run: |
-          test -f dist/MTConnectExplorer
-          chmod +x dist/MTConnectExplorer
-          cp THIRD_PARTY_NOTICES.txt dist/
-          tar -czvf "$ARCHIVE" -C dist MTConnectExplorer THIRD_PARTY_NOTICES.txt
+      # Shared composite action, identical to the one the PR gate runs — see
+      # .github/actions/build-linux/action.yml for why. It derives the archive
+      # name from the same version reader and has already asserted the archive
+      # exists and holds the binary, so the upload is the only step left.
+      - id: build
+        uses: ./.github/actions/build-linux
       - uses: actions/upload-artifact@v7
         with:
           name: linux
-          path: ${{ env.ARCHIVE }}
+          path: ${{ steps.build.outputs.archive }}
           if-no-files-found: error
 
   build-windows:
     needs: version
     if: needs.version.outputs.should_release == 'true'
     runs-on: windows-latest
-    env:
-      ARCHIVE: MTConnectExplorer-v${{ needs.version.outputs.version }}-win64.zip
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-      - name: Build with build.bat
-        shell: cmd
-        run: build.bat ci
-      - name: Generate third-party notices
-        shell: cmd
-        run: venv\Scripts\python.exe packaging\generate_notices.py THIRD_PARTY_NOTICES.txt
-      - name: Package zip
-        shell: pwsh
-        run: |
-          if (-not (Test-Path dist\MTConnectExplorer.exe)) {
-            throw "dist\MTConnectExplorer.exe not found"
-          }
-          Copy-Item THIRD_PARTY_NOTICES.txt dist\
-          Compress-Archive -Path dist\MTConnectExplorer.exe, dist\THIRD_PARTY_NOTICES.txt -DestinationPath "$env:ARCHIVE" -Force
+      # Shared composite action, identical to the one the PR gate runs.
+      - id: build
+        uses: ./.github/actions/build-windows
       - uses: actions/upload-artifact@v7
         with:
           name: windows
-          path: ${{ env.ARCHIVE }}
+          path: ${{ steps.build.outputs.archive }}
           if-no-files-found: error
 
   release:
