@@ -1,34 +1,22 @@
-import shutil
-
 import streamlit as st
 
-from src.pages.core import (
-    DATASETS_DIR,
-    get_capture_state,
-    get_datasets_state,
-    get_play_state,
-)
+from mtconnect_explorer_client import ApiError
+
+from src.pages.api import get_client
+from src.pages.core import get_datasets_state
 
 # Maximum size (MB) of a single uploaded dataset. Must not exceed the server's
 # server.maxUploadSize (set to 5 GB in .streamlit/config.toml and src/main.py).
 _MAX_UPLOAD_MB = 5120
 
-
-def _dataset_status() -> dict:
-    """Map dataset filename -> status label ('Playing', 'Capturing', or both)
-    for datasets currently in use by a play or capture session."""
-    play_state = get_play_state()
-    capture_state = get_capture_state()
-    kinds: dict = {}
-    for s in play_state.sessions.values():
-        kinds.setdefault(s.dataset_file, set()).add("Playing")
-    for s in capture_state.sessions.values():
-        kinds.setdefault(s.filename, set()).add("Capturing")
-    return {name: " & ".join(sorted(k)) for name, k in kinds.items()}
-
-
 _EXT = ".jsonl"
-_INVALID_NAME_CHARS = set('<>:"/\\|?*')
+
+
+def _status_labels(in_use: list) -> str:
+    """Format a dataset's in-use scopes for the Status column ('Playing',
+    'Capturing', or 'Capturing & Playing')."""
+    labels = {"play": "Playing", "capture": "Capturing"}
+    return " & ".join(sorted(labels[u] for u in in_use))
 
 
 @st.dialog("Rename dataset")
@@ -53,26 +41,36 @@ def _rename_dialog(filename: str) -> None:
         target_name = f"{new_stem}{_EXT}"
         if not new_stem:
             st.error("Name cannot be empty.")
-        elif any(ch in _INVALID_NAME_CHARS for ch in new_stem):
-            st.error('Name cannot contain any of: < > : " / \\ | ? *')
         elif target_name == filename:
             st.rerun()  # No change.
-        elif (DATASETS_DIR / target_name).exists():
-            st.error("A dataset with that name already exists.")
-        elif filename in _dataset_status():
-            st.error("This dataset is now in use and cannot be renamed.")
         else:
-            (DATASETS_DIR / filename).rename(DATASETS_DIR / target_name)
-            st.rerun()
+            try:
+                get_client().datasets_rename(filename, target_name)
+            except ApiError as ex:
+                if ex.code == "invalid_name":
+                    st.error('Name cannot contain any of: < > : " / \\ | ? *')
+                elif ex.code == "dataset_exists":
+                    st.error("A dataset with that name already exists.")
+                elif ex.code == "dataset_in_use":
+                    st.error("This dataset is now in use and cannot be renamed.")
+                else:
+                    st.error(ex.message)
+            else:
+                st.rerun()
 
 
 def datasets_page() -> None:
     st.set_page_config(page_title="MTConnectExplorer", layout="wide")
     st.title("Datasets")
     get_datasets_state()
-    DATASETS_DIR.mkdir(exist_ok=True)
+    client = get_client()
 
-    status_map = _dataset_status()
+    try:
+        infos = client.datasets_list()
+    except ApiError as ex:
+        st.error(f"API error: {ex.message}")
+        return
+    status_map = {d.name: _status_labels(d.in_use) for d in infos if d.in_use}
 
     # --- Upload (drag-and-drop onto the area, or browse) ---
     if "ds_upload_gen" not in st.session_state:
@@ -85,18 +83,25 @@ def datasets_page() -> None:
         key=f"ds_upload_{st.session_state.ds_upload_gen}",
     )
     if uploaded:
-        saved, skipped = [], []
+        saved, failed = [], []
         for uf in uploaded:
-            if uf.name in status_map:
-                skipped.append(uf.name)
-                continue
-            # Stream to disk to avoid holding a second full copy in memory.
+            # Stream the Streamlit UploadedFile (a file-like object) through the
+            # multipart endpoint — no second full copy in frontend memory.
             uf.seek(0)
-            with open(DATASETS_DIR / uf.name, "wb") as out:
-                shutil.copyfileobj(uf, out)
-            saved.append(uf.name)
-        for name in skipped:
-            st.warning(f"Skipped '{name}': a dataset with that name is currently in use.")
+            try:
+                client.datasets_upload(uf.name, uf)
+            except ApiError as ex:
+                failed.append((uf.name, ex))
+            else:
+                saved.append(uf.name)
+        for name, ex in failed:
+            if ex.code == "dataset_in_use":
+                st.warning(f"Skipped '{name}': a dataset with that name is currently in use.")
+            elif ex.code == "dataset_exists":
+                st.warning(f"Skipped '{name}': a dataset with that name already exists "
+                           "(overwriting is not allowed — delete it first).")
+            else:
+                st.warning(f"Skipped '{name}': {ex.message}")
         if saved:
             st.success(f"Uploaded: {', '.join(saved)}")
             # Bump the key so the uploader resets and files aren't re-saved on rerun.
@@ -105,8 +110,7 @@ def datasets_page() -> None:
 
     st.divider()
 
-    files = sorted(DATASETS_DIR.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
-    if not files:
+    if not infos:
         st.info("No datasets found in datasets/.")
         return
 
@@ -119,37 +123,40 @@ def datasets_page() -> None:
     h6.markdown("**Status**")
     st.divider()
 
-    for f in files:
-        stat = f.stat()
-        status = status_map.get(f.name)
+    for info in infos:
+        status = status_map.get(info.name)
         busy = status is not None
         c1, c2, c3, c4, c5, c6 = st.columns([4, 1, 1, 1, 1, 2])
-        c1.write(f.name)
-        c2.write(round(stat.st_size / (1024 * 1024), 1))
+        c1.write(info.name)
+        c2.write(round(info.size_bytes / (1024 * 1024), 1))
         with c3:
             st.download_button(
                 "Download",
-                data=f.read_bytes(),
-                file_name=f.name,
+                data=b"".join(client.datasets_download(info.name)),
+                file_name=info.name,
                 mime="application/octet-stream",
-                key=f"dl_{f.name}",
+                key=f"dl_{info.name}",
             )
         with c4:
             if st.button(
                 "Rename",
-                key=f"rn_{f.name}",
+                key=f"rn_{info.name}",
                 disabled=busy,
                 help="Cannot rename while the dataset is being played or captured." if busy else None,
             ):
-                _rename_dialog(f.name)
+                _rename_dialog(info.name)
         with c5:
             if st.button(
                 "Delete",
-                key=f"del_{f.name}",
+                key=f"del_{info.name}",
                 type="secondary",
                 disabled=busy,
                 help="Cannot delete while the dataset is being played or captured." if busy else None,
             ):
-                f.unlink()
-                st.rerun()
+                try:
+                    client.datasets_delete(info.name)
+                except ApiError as ex:
+                    st.error(ex.message)
+                else:
+                    st.rerun()
         c6.write(status or "")

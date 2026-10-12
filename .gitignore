@@ -1,5 +1,6 @@
 __pycache__/
-.claude/
+.pytest_cache/
+.claude/*.local.json
 build/
 datasets/
 dist/

@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import http.client
 import logging
 import threading
@@ -6,6 +6,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from collections.abc import Iterator
 from typing import Any, Dict, List, Literal, Optional, Tuple, Annotated
 import xml.etree.ElementTree as ET
@@ -902,17 +903,22 @@ class MtConnectExplorer:
         configuration: MtConnectClientConfiguration,
         interval_ms: int = 1000,
         mode: Literal["stream", "sample", "current"] = "stream",
-        history_max: int = 100,
+        history_max_points: int = 100_000,
     ) -> None:
         self._configuration = configuration
         self._interval_ms = interval_ms
         self._mode = mode
-        self._history_max = history_max
+        # Absolute per-DataItem ceiling. The retained span is otherwise driven by
+        # set_history_window() (the largest configured plot duration), so a plot
+        # of that duration can fill even at a high sample rate.
+        self._history_max_points = history_max_points
+        self._history_max_age: Optional[timedelta] = None
         self._client = MtConnectClient(configuration)
 
         self._probe_devices: List[MtConnectDevice] = []
         self._observations: Dict[str, MtConnectObservation] = {}
-        self._history: Dict[str, List[MtConnectObservation]] = {}
+        # Per-DataItem ring buffer (maxlen = history_max_points) — O(1) eviction.
+        self._history: Dict[str, deque] = {}
         self._lock = threading.Lock()
 
         self._thread: Optional[threading.Thread] = None
@@ -936,7 +942,16 @@ class MtConnectExplorer:
     def get_history(self, data_item_id: str) -> List[MtConnectObservation]:
         """Return the buffered observation history for a DataItem."""
         with self._lock:
-            return list(self._history.get(data_item_id, []))
+            return list(self._history.get(data_item_id, ()))
+
+    def set_history_window(self, max_age: Optional[timedelta]) -> None:
+        """Set how far back to retain samples per DataItem: everything within
+        ``max_age`` of that item's most recent sample is kept (still capped at
+        ``history_max_points``). The Explore UI sets this from the largest of the
+        history / pinned-plot durations so a plot of that span can fill up. Pass
+        ``None`` to disable age-based trimming (only the point cap applies)."""
+        with self._lock:
+            self._history_max_age = max_age
 
     def start(self) -> "MtConnectExplorer":
         if self._thread is not None:
@@ -958,15 +973,24 @@ class MtConnectExplorer:
 
     def _update_observations(self, observations: List[MtConnectObservation]) -> None:
         with self._lock:
+            max_age = self._history_max_age
             for obs in observations:
                 did = obs.attributes.get("dataItemId", "")
                 if not did:
                     continue
                 self._observations[did] = obs
-                hist = self._history.setdefault(did, [])
+                hist = self._history.get(did)
+                if hist is None:
+                    # maxlen enforces the absolute point cap with O(1) eviction.
+                    hist = deque(maxlen=self._history_max_points)
+                    self._history[did] = hist
                 hist.append(obs)
-                if len(hist) > self._history_max:
-                    del hist[: -self._history_max]
+                # Time-based retention: drop samples older than max_age relative to
+                # this item's most recent sample (front of a time-ordered deque).
+                if max_age is not None:
+                    cutoff = hist[-1].timestamp - max_age
+                    while hist and hist[0].timestamp < cutoff:
+                        hist.popleft()
 
     def _loop(self) -> None:
         reader = None

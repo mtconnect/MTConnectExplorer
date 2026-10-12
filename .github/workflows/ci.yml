@@ -19,71 +19,115 @@ permissions:
 
 jobs:
   version-check:
-    # Pre-merge guard for release PRs: a PR into release/X.Y must carry a
-    # matching X.Y version, so the post-merge release workflow can't fail on a
-    # version/branch mismatch. No-op for PRs into main / dev/*.
-    # Mark as a required status check on release/* branches.
+    # Three guards, deliberately at three different scopes:
+    #   ALWAYS            — `__version__` parses and is semver. Not
+    #                       release-specific: a malformed version breaks the
+    #                       build, the archive names, and the tag.
+    #   main, dev/*,      — the version is not one that has already been
+    #   release/*           released, so a released number can never be the
+    #                       current one on a protected branch. See GUARD 3.
+    #   release/* only    — the X.Y line matches the target branch.
+    # Mark as a required status check on main, dev/* and release/* branches.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Validate __version__ matches the target release branch
+      - uses: actions/checkout@v7
+      - name: Validate __version__ (and, on protected branches, that it can still ship)
         run: |
+          # Reads + semver-validates in one place, shared with release.yml. Do
+          # NOT inline a parse here: the two inlined copies this replaced were
+          # both unanchored. See the script's header.
+          version=$(bash .github/scripts/read-version.sh) || exit 1
+          echo "OK: __version__ '$version' is well-formed."
+
           base="${{ github.base_ref }}"
-          if [[ ! "$base" =~ ^release/([0-9]+)\.([0-9]+)$ ]]; then
-            echo "Base branch '$base' is not a release branch; skipping version check."
-            exit 0
+          tag="v$version"
+
+          # GUARD 2 (release PRs only) — the version's X.Y line matches the
+          # target branch, so the post-merge release workflow can't fail on a
+          # version/branch mismatch. Catches "merged the wrong PR into the wrong
+          # branch".
+          if [[ "$base" =~ ^release/([0-9]+)\.([0-9]+)$ ]]; then
+            expected_minor="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+            actual_minor=$(echo "$version" | cut -d'-' -f1 | cut -d. -f1-2)
+            if [ "$expected_minor" != "$actual_minor" ]; then
+              echo "::error::PR targets '$base' which expects version $expected_minor.x, but __version__ is '$version'"
+              exit 1
+            fi
+            echo "OK: __version__ '$version' matches target branch '$base'."
           fi
 
-          # Read __version__ from src/__version__.py
-          version=$(grep -oP '"\K[^"]+' src/__version__.py)
-          if [ -z "$version" ]; then
-            echo "::error::Failed to parse __version__ from src/__version__.py"
-            exit 1
+          # GUARD 3 (main, dev/* AND release/*) — the version must not be released
+          # already. One check, two distinct failures it prevents:
+          #
+          #   release/* — merging IS how a release is made, so a PR whose
+          #               version is already tagged can only produce a run that
+          #               skips itself (release.yml sets should_release=false for
+          #               exactly this). A red PR now beats a silent no-op later.
+          #   main      — main stages the NEXT release. Letting it sit at a
+          #               version that already shipped means the stale number
+          #               rides the next forward-merge into release/*, where it
+          #               produces nothing. Refusing it at the door is what keeps
+          #               a released version from ever being current on main.
+          #
+          #   dev/X.Y   — dev/X.Y is the `main` of the X.Y patch line, so the
+          #               same argument applies one level down: a fix landing on
+          #               dev/1.0 while it still reads 1.0.0 would forward into
+          #               release/1.0 and release nothing.
+          #
+          # Only the FIRST PR after a release has to bump. Once the branch reads
+          # an unreleased version, later PRs onto it pass without bumping again —
+          # so several fixes accumulate under one pending number, which is what
+          # ships when the branch is forwarded.
+          #
+          # CONSEQUENCE: syncing a release branch with main WITHOUT releasing is
+          # no longer a single merge. That is the intended trade.
+          #
+          # Assign-then-test, never `git ls-remote ... | grep -q`: `set -e` must
+          # abort on a failed LOOKUP rather than let it read as "not released".
+          if [ "$base" = "main" ] || [[ "$base" =~ ^(dev|release)/ ]]; then
+            existing=$(git ls-remote --tags origin "refs/tags/$tag")
+            if [ -n "$existing" ]; then
+              echo "::error::$tag is already released (tagged on the remote), so it must not be the current __version__ on '$base'. Bump __version__ in this PR — see contributing.md → Triggering a release."
+              exit 1
+            fi
+            echo "OK: $tag is not yet on the remote."
+          else
+            echo "Base branch '$base' is not a protected staging or release branch; skipping the release-state check."
           fi
 
-          # Validate semver (mirrors release.yml)
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::__version__ '$version' is not valid semver (expected MAJOR.MINOR.PATCH[-PRERELEASE])"
-            exit 1
-          fi
+  test:
+    # API/service test suite (tests/). Tests that need the bundled MTConnect
+    # agent binary self-skip when src/bin/agent is absent, so this job only
+    # builds the venv (not the agent). Not a required status check (yet).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Set up venv
+        run: |
+          python -m venv venv
+          venv/bin/pip install -Ur requirements-src.txt
+      - name: Run pytest
+        run: venv/bin/python -m pytest tests -q
 
-          # Re-match the base branch (the semver test above clobbered BASH_REMATCH)
-          # to recover the expected X.Y line, then compare to the version's line.
-          [[ "$base" =~ ^release/([0-9]+)\.([0-9]+)$ ]]
-          expected_minor="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
-          actual_minor=$(echo "$version" | cut -d'-' -f1 | cut -d. -f1-2)
-          if [ "$expected_minor" != "$actual_minor" ]; then
-            echo "::error::PR targets '$base' which expects version $expected_minor.x, but __version__ is '$version'"
-            exit 1
-          fi
-
-          echo "OK: __version__ '$version' matches target branch '$base'."
-
+  # ⭐ THE GATE RUNS THE RELEASE BUILD, NOT A CHEAPER APPROXIMATION OF IT.
+  # Both jobs below are the SAME composite actions release.yml uses, so the
+  # third-party notices and the tar.gz/zip packaging are exercised on every PR.
+  # They used to be release-only ("the gate just needs to know it compiles"),
+  # which meant a packaging break was first seen after the merge into
+  # release/X.Y — when the version is already spent and the fix costs another
+  # bump. See .github/actions/build-linux/action.yml. Only the artifact upload
+  # is release-specific.
   build-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Build with make
-        run: make
-      - name: Verify binary was produced
-        run: test -f dist/MTConnectExplorer
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/build-linux
 
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Build with build.bat
-        shell: cmd
-        run: build.bat ci
-      - name: Verify binary was produced
-        shell: pwsh
-        run: |
-          if (-not (Test-Path dist\MTConnectExplorer.exe)) {
-            throw "dist\MTConnectExplorer.exe not found"
-          }
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/build-windows

@@ -12,7 +12,7 @@ Three pieces of equipment are supported:
   * ``MILL_3AXIS``  — a 3-axis vertical mill (X/Y/Z, each 0..1000 mm) running a
     canned program: trace the stock bounding box, a facing raster, then a
     circular boring pattern (stepping deeper in Z). Loops.
-  * ``MILL_5AXIS_TRUNNION``  — a 5-axis trunnion mill: the head carries X/Y/Z while the
+  * ``MILL_5AXIS_TRUNNION_BC``  — a 5-axis trunnion mill: the head carries X/Y/Z while the
     table tilts about Y (B1) and rotates about Z (C1). Its canned program runs a
     set of 3+2 indexed facing passes followed by a simultaneous 5-axis contour
     (a helical wrap around the part). Loops.
@@ -49,15 +49,18 @@ logger = logging.getLogger(__name__)
 # Equipment types
 # ===========================================================================
 class EquipmentType(str, Enum):
-    MILL_3AXIS = "MILL_3AXIS"
-    MILL_5AXIS_TRUNNION = "MILL_5AXIS_TRUNNION"
-    ROBOT_6DOF = "ROBOT_6DOF"
+    # Values are the API's equipment keys (URL path segments, catalog `type`,
+    # config discriminators) — lowercase, with axis orientations encoded where
+    # they matter (the trunnion's rotaries are B/C).
+    MILL_3AXIS = "mill_3axis"
+    MILL_5AXIS_TRUNNION_BC = "mill_5axis_trunnion_bc"
+    ROBOT_6DOF = "robot_6dof"
 
     @property
     def label(self) -> str:
         return {
             EquipmentType.MILL_3AXIS: "3-Axis Mill",
-            EquipmentType.MILL_5AXIS_TRUNNION: "5-Axis Trunnion Mill (B/C)",
+            EquipmentType.MILL_5AXIS_TRUNNION_BC: "5-Axis Trunnion Mill (B/C)",
             EquipmentType.ROBOT_6DOF: "6-DOF Robot",
         }[self]
 
@@ -65,18 +68,45 @@ class EquipmentType(str, Enum):
     def default_device_name(self) -> str:
         return {
             EquipmentType.MILL_3AXIS: "Mill",
-            EquipmentType.MILL_5AXIS_TRUNNION: "TrunnionMill",
+            EquipmentType.MILL_5AXIS_TRUNNION_BC: "TrunnionMill",
             EquipmentType.ROBOT_6DOF: "Robot",
         }[self]
 
     @property
     def routine_name(self) -> str:
         """Human label for the (single, for now) canned routine of this type."""
-        return {
-            EquipmentType.MILL_3AXIS: "Canned G-Code Routine",
-            EquipmentType.MILL_5AXIS_TRUNNION: "Canned 3+2 & Simultaneous Routine",
-            EquipmentType.ROBOT_6DOF: "Canned Pick-and-Place",
-        }[self]
+        return "Default Routine"
+
+
+# ---------------------------------------------------------------------------
+# Native axis travel (mm for linear, deg for rotary) — the scaling anchor.
+#
+# Configured limits scale each routine affinely FROM these ranges TO the
+# configured ones, so a default request (limits == native travel) reproduces
+# the canned motion identically, and any canned coordinate (all of which lie
+# inside the native travel — asserted by tests) lands inside the configured
+# limits. The API schemas in lib/ mirror these as their defaults (meters/deg);
+# tests keep the two in lockstep. The trunnion's C axis is continuous
+# (unlimited) and is never scaled.
+# ---------------------------------------------------------------------------
+NATIVE_TRAVEL: Dict[str, Dict[str, Tuple[float, float]]] = {
+    "mill_3axis": {"x": (0.0, 1000.0), "y": (0.0, 1000.0), "z": (0.0, 1000.0)},
+    "mill_5axis_trunnion_bc": {
+        "x": (0.0, 1000.0), "y": (0.0, 1000.0), "z": (0.0, 1000.0),
+        "b": (-120.0, 120.0),
+    },
+    "robot_6dof": {
+        "j1": (-170.0, 170.0), "j2": (-100.0, 135.0), "j3": (-80.0, 155.0),
+        "j4": (-180.0, 180.0), "j5": (-120.0, 120.0), "j6": (-180.0, 180.0),
+    },
+}
+
+# Coordinate-vector index -> axis key (None = never scaled, e.g. continuous C).
+COORD_AXES: Dict[str, Tuple[Optional[str], ...]] = {
+    "mill_3axis": ("x", "y", "z"),
+    "mill_5axis_trunnion_bc": ("x", "y", "z", "b", None),
+    "robot_6dof": ("j1", "j2", "j3", "j4", "j5", "j6"),
+}
 
 
 # ===========================================================================
@@ -198,7 +228,21 @@ def robot_fk(angles_deg: List[float]) -> Tuple[float, float, float]:
 # ===========================================================================
 # Device model builders (return <Device> XML fragments)
 # ===========================================================================
-def build_mill_device_model(device_name: str, uuid: str) -> str:
+def _constraints_xml(cfg: Dict[str, Tuple[float, float]], axis: str) -> str:
+    """MTConnect Constraints element publishing an axis's configured limits
+    (native units: mm / deg), or '' for unlimited (continuous) axes."""
+    if axis not in cfg:
+        return ""
+    lo, hi = cfg[axis]
+    return f"<Constraints><Minimum>{lo:g}</Minimum><Maximum>{hi:g}</Maximum></Constraints>"
+
+
+def build_mill_device_model(
+    device_name: str,
+    uuid: str,
+    limits: Optional[Dict[str, Tuple[float, float]]] = None,
+) -> str:
+    cfg = merged_limits(EquipmentType.MILL_3AXIS, limits)
     return dedent(f"""
     <Device uuid="{uuid}" name="{device_name}" id="{uuid}">
       <Description model="3-Axis VMC" manufacturer="Generic">Simulated 3-axis vertical machining center</Description>
@@ -211,19 +255,19 @@ def build_mill_device_model(device_name: str, uuid: str) -> str:
           <Components>
             <Linear id="x" name="X">
               <DataItems>
-                <DataItem id="Xact"  category="SAMPLE" type="POSITION" subType="ACTUAL" name="Xact"  units="MILLIMETER" nativeUnits="MILLIMETER"/>
+                <DataItem id="Xact"  category="SAMPLE" type="POSITION" subType="ACTUAL" name="Xact"  units="MILLIMETER" nativeUnits="MILLIMETER">{_constraints_xml(cfg, "x")}</DataItem>
                 <DataItem id="Xload" category="SAMPLE" type="LOAD"                      name="Xload" units="PERCENT"    nativeUnits="PERCENT"/>
               </DataItems>
             </Linear>
             <Linear id="y" name="Y">
               <DataItems>
-                <DataItem id="Yact"  category="SAMPLE" type="POSITION" subType="ACTUAL" name="Yact"  units="MILLIMETER" nativeUnits="MILLIMETER"/>
+                <DataItem id="Yact"  category="SAMPLE" type="POSITION" subType="ACTUAL" name="Yact"  units="MILLIMETER" nativeUnits="MILLIMETER">{_constraints_xml(cfg, "y")}</DataItem>
                 <DataItem id="Yload" category="SAMPLE" type="LOAD"                      name="Yload" units="PERCENT"    nativeUnits="PERCENT"/>
               </DataItems>
             </Linear>
             <Linear id="z" name="Z">
               <DataItems>
-                <DataItem id="Zact"  category="SAMPLE" type="POSITION" subType="ACTUAL" name="Zact"  units="MILLIMETER" nativeUnits="MILLIMETER"/>
+                <DataItem id="Zact"  category="SAMPLE" type="POSITION" subType="ACTUAL" name="Zact"  units="MILLIMETER" nativeUnits="MILLIMETER">{_constraints_xml(cfg, "z")}</DataItem>
                 <DataItem id="Zload" category="SAMPLE" type="LOAD"                      name="Zload" units="PERCENT"    nativeUnits="PERCENT"/>
               </DataItems>
             </Linear>
@@ -258,12 +302,18 @@ def build_mill_device_model(device_name: str, uuid: str) -> str:
     """).strip()
 
 
-def build_mill5_device_model(device_name: str, uuid: str) -> str:
+def build_mill5_device_model(
+    device_name: str,
+    uuid: str,
+    limits: Optional[Dict[str, Tuple[float, float]]] = None,
+) -> str:
     # 5-axis trunnion mill. The three linear axes (X/Y/Z) ride on the head; the
     # two rotary positioning axes are B1 (tilts the table about Y) and C1 (rotates
     # the table about Z). The tool-driving spindle is a separate Rotary named "S"
     # (ROTARY_MODE=SPINDLE) so it does not collide with the C1 positioning axis —
     # the 3-axis model reuses "C1" for its spindle, but here C1 is the C axis.
+    # C is continuous, so Cact carries no Constraints.
+    cfg = merged_limits(EquipmentType.MILL_5AXIS_TRUNNION_BC, limits)
     return dedent(f"""
     <Device uuid="{uuid}" name="{device_name}" id="{uuid}">
       <Description model="5-Axis VMC" manufacturer="Generic">Simulated 5-axis vertical machining center (trunnion B/C)</Description>
@@ -276,25 +326,25 @@ def build_mill5_device_model(device_name: str, uuid: str) -> str:
           <Components>
             <Linear id="x" name="X">
               <DataItems>
-                <DataItem id="Xact"  category="SAMPLE" type="POSITION" subType="ACTUAL" name="Xact"  units="MILLIMETER" nativeUnits="MILLIMETER"/>
+                <DataItem id="Xact"  category="SAMPLE" type="POSITION" subType="ACTUAL" name="Xact"  units="MILLIMETER" nativeUnits="MILLIMETER">{_constraints_xml(cfg, "x")}</DataItem>
                 <DataItem id="Xload" category="SAMPLE" type="LOAD"                      name="Xload" units="PERCENT"    nativeUnits="PERCENT"/>
               </DataItems>
             </Linear>
             <Linear id="y" name="Y">
               <DataItems>
-                <DataItem id="Yact"  category="SAMPLE" type="POSITION" subType="ACTUAL" name="Yact"  units="MILLIMETER" nativeUnits="MILLIMETER"/>
+                <DataItem id="Yact"  category="SAMPLE" type="POSITION" subType="ACTUAL" name="Yact"  units="MILLIMETER" nativeUnits="MILLIMETER">{_constraints_xml(cfg, "y")}</DataItem>
                 <DataItem id="Yload" category="SAMPLE" type="LOAD"                      name="Yload" units="PERCENT"    nativeUnits="PERCENT"/>
               </DataItems>
             </Linear>
             <Linear id="z" name="Z">
               <DataItems>
-                <DataItem id="Zact"  category="SAMPLE" type="POSITION" subType="ACTUAL" name="Zact"  units="MILLIMETER" nativeUnits="MILLIMETER"/>
+                <DataItem id="Zact"  category="SAMPLE" type="POSITION" subType="ACTUAL" name="Zact"  units="MILLIMETER" nativeUnits="MILLIMETER">{_constraints_xml(cfg, "z")}</DataItem>
                 <DataItem id="Zload" category="SAMPLE" type="LOAD"                      name="Zload" units="PERCENT"    nativeUnits="PERCENT"/>
               </DataItems>
             </Linear>
             <Rotary id="b1" name="B1">
               <DataItems>
-                <DataItem id="Bact"  category="SAMPLE" type="ANGLE" subType="ACTUAL" name="Bact"  units="DEGREE"  nativeUnits="DEGREE"/>
+                <DataItem id="Bact"  category="SAMPLE" type="ANGLE" subType="ACTUAL" name="Bact"  units="DEGREE"  nativeUnits="DEGREE">{_constraints_xml(cfg, "b")}</DataItem>
                 <DataItem id="Bload" category="SAMPLE" type="LOAD"                   name="Bload" units="PERCENT" nativeUnits="PERCENT"/>
                 <DataItem id="Bmode" category="EVENT"  type="ROTARY_MODE"            name="Bmode"/>
               </DataItems>
@@ -337,16 +387,21 @@ def build_mill5_device_model(device_name: str, uuid: str) -> str:
     """).strip()
 
 
-def build_robot_device_model(device_name: str, uuid: str) -> str:
+def build_robot_device_model(
+    device_name: str,
+    uuid: str,
+    limits: Optional[Dict[str, Tuple[float, float]]] = None,
+) -> str:
     # Articulated-robot joints are modeled as Rotary axes named J1..Jn (not the
     # A/B/C of a machine tool), each reporting its angular POSITION via an ANGLE
     # SAMPLE — per the MTConnect standard's robot modeling guidance.
+    cfg = merged_limits(EquipmentType.ROBOT_6DOF, limits)
     joints = ""
     for i in range(1, 7):
         joints += dedent(f"""
             <Rotary id="joint{i}" name="J{i}">
               <DataItems>
-                <DataItem id="J{i}" category="SAMPLE" type="ANGLE" subType="ACTUAL" name="J{i}" units="DEGREE" nativeUnits="DEGREE"/>
+                <DataItem id="J{i}" category="SAMPLE" type="ANGLE" subType="ACTUAL" name="J{i}" units="DEGREE" nativeUnits="DEGREE">{_constraints_xml(cfg, f"j{i}")}</DataItem>
               </DataItems>
             </Rotary>
         """).rstrip("\n")
@@ -615,7 +670,7 @@ def build_mill5_routine() -> RoutineSpec:
                  "y0": _M5_CY - _M5_HALF, "y1": _M5_CY + _M5_HALF,
                  "z_bot": _M5_Z_BOT, "z_top": _M5_Z_TOP, "z_safe": _M5_Z_SAFE},
     }
-    return RoutineSpec(EquipmentType.MILL_5AXIS_TRUNNION,
+    return RoutineSpec(EquipmentType.MILL_5AXIS_TRUNNION_BC,
                        ("Xact", "Yact", "Zact", "Bact", "Cact"),
                        start, moves, geometry)
 
@@ -662,12 +717,123 @@ def build_robot_routine() -> RoutineSpec:
                        _R_HOME, moves, geometry)
 
 
-def build_routine(equipment: EquipmentType) -> RoutineSpec:
+def _canned_routine(equipment: EquipmentType) -> RoutineSpec:
     if equipment == EquipmentType.MILL_3AXIS:
         return build_mill_routine()
-    if equipment == EquipmentType.MILL_5AXIS_TRUNNION:
+    if equipment == EquipmentType.MILL_5AXIS_TRUNNION_BC:
         return build_mill5_routine()
     return build_robot_routine()
+
+
+def merged_limits(
+    equipment: EquipmentType,
+    limits: Optional[Dict[str, Tuple[float, float]]] = None,
+) -> Dict[str, Tuple[float, float]]:
+    """The full per-axis limit set: native travel overridden by any configured
+    entries (axis key -> (min, max), mm for linear / deg for rotary)."""
+    native = NATIVE_TRAVEL[equipment.value]
+    merged = dict(native)
+    for key, rng in (limits or {}).items():
+        if key in merged:
+            merged[key] = (float(rng[0]), float(rng[1]))
+    return merged
+
+
+def _axis_transforms(
+    equipment: EquipmentType,
+    cfg: Dict[str, Tuple[float, float]],
+) -> List[Tuple[float, float]]:
+    """Per-coordinate affine (gain, offset) mapping native travel -> configured
+    limits; identity for unscaled coordinates (e.g. the trunnion's continuous C)."""
+    native = NATIVE_TRAVEL[equipment.value]
+    transforms: List[Tuple[float, float]] = []
+    for axis in COORD_AXES[equipment.value]:
+        if axis is None:
+            transforms.append((1.0, 0.0))
+            continue
+        (n0, n1), (c0, c1) = native[axis], cfg[axis]
+        gain = (c1 - c0) / (n1 - n0)
+        transforms.append((gain, c0 - gain * n0))
+    return transforms
+
+
+def _rebuild_geometry(
+    equipment: EquipmentType,
+    canned: Dict[str, Any],
+    transforms: List[Tuple[float, float]],
+    cfg: Dict[str, Tuple[float, float]],
+) -> Dict[str, Any]:
+    """Geometry for the configured envelope: coordinates are mapped with the
+    same per-axis affines as the motion; purely visual dimensions (tool
+    diameter, stock size) scale with the axis gains so the scene keeps its
+    proportions. The robot's link lengths are physical structure — unchanged."""
+    if equipment == EquipmentType.ROBOT_6DOF:
+        return canned
+
+    (gx, ox), (gy, oy), (gz, oz) = transforms[0], transforms[1], transforms[2]
+    min_gain = min(gx, gy, gz)
+    env = {
+        "x0": cfg["x"][0], "x1": cfg["x"][1],
+        "y0": cfg["y"][0], "y1": cfg["y"][1],
+        "z0": cfg["z"][0], "z1": cfg["z"][1],
+    }
+    wk = canned["work"]
+    work = {
+        "x0": gx * wk["x0"] + ox, "x1": gx * wk["x1"] + ox,
+        "y0": gy * wk["y0"] + oy, "y1": gy * wk["y1"] + oy,
+        "z_bot": gz * wk["z_bot"] + oz, "z_top": gz * wk["z_top"] + oz,
+        "z_safe": gz * wk["z_safe"] + oz,
+    }
+    geometry: Dict[str, Any] = {
+        "env": env,
+        "tool_dia": max(canned["tool_dia"] * min_gain, 4.0),
+        "work": work,
+    }
+    if equipment == EquipmentType.MILL_5AXIS_TRUNNION_BC:
+        piv = canned["pivot"]
+        geometry["pivot"] = [gx * piv[0] + ox, gy * piv[1] + oy, gz * piv[2] + oz]
+        geometry["half_x"] = canned["half"] * gx
+        geometry["half_y"] = canned["half"] * gy
+        geometry["stock_h"] = canned["stock_h"] * gz
+    return geometry
+
+
+def build_routine(
+    equipment: EquipmentType,
+    limits: Optional[Dict[str, Tuple[float, float]]] = None,
+) -> RoutineSpec:
+    """The equipment's routine, scaled into the configured axis limits.
+
+    ``limits`` maps axis keys ("x"/"y"/"z"/"b"/"j1".."j6") to (min, max) in mm
+    (linear) / deg (rotary); missing axes default to NATIVE_TRAVEL, so no
+    limits (or limits equal to the native travel) reproduces the canned motion
+    identically. Each coordinate is mapped affinely native->configured, per-move
+    feed values are recomputed from the scaled linear travel, and the geometry
+    is rebuilt for the configured envelope.
+    """
+    canned = _canned_routine(equipment)
+    cfg = merged_limits(equipment, limits)
+    transforms = _axis_transforms(equipment, cfg)
+
+    def tf(vec: Tuple[float, ...]) -> Tuple[float, ...]:
+        return tuple(g * v + o for (g, o), v in zip(transforms, vec))
+
+    start = tf(canned.start)
+    # The mills' first three coordinates are the linear axes whose scaled travel
+    # determines the actual feed; the robot has no meaningful path feed to fix.
+    lin_n = 0 if equipment == EquipmentType.ROBOT_6DOF else 3
+    moves: List[_Move] = []
+    prev = list(start)
+    for m in canned.moves:
+        target = tf(m.target)
+        meta = dict(m.meta)
+        if lin_n and meta.get("feed"):
+            meta["feed"] = math.dist(prev[:lin_n], target[:lin_n]) / max(m.duration, 1e-6)
+        moves.append(_Move(target=target, duration=m.duration, meta=meta))
+        prev = list(target)
+
+    geometry = _rebuild_geometry(equipment, canned.geometry, transforms, cfg)
+    return RoutineSpec(equipment, canned.coord_names, start, moves, geometry)
 
 
 # ===========================================================================
@@ -701,20 +867,24 @@ class EquipmentSimulator:
         port: int = 7878,
         thread_name: str = "equipment-simulator",
         tick_s: float = 0.01,
+        limits: Optional[Dict[str, Tuple[float, float]]] = None,
     ) -> None:
+        """``limits``: configured axis limits (axis key -> (min, max), mm/deg);
+        the routine is scaled into them and the device model publishes them as
+        MTConnect Constraints. None = the equipment's native travel."""
         self._equipment = equipment
         self._device_name = device_name
         self._thread_name = thread_name
         self._tick_s = tick_s
 
-        self._spec = build_routine(equipment)
+        self._spec = build_routine(equipment, limits)
         uuid = f"{device_name}.sim"
         if equipment == EquipmentType.MILL_3AXIS:
-            device_model = build_mill_device_model(device_name, uuid)
-        elif equipment == EquipmentType.MILL_5AXIS_TRUNNION:
-            device_model = build_mill5_device_model(device_name, uuid)
+            device_model = build_mill_device_model(device_name, uuid, limits)
+        elif equipment == EquipmentType.MILL_5AXIS_TRUNNION_BC:
+            device_model = build_mill5_device_model(device_name, uuid, limits)
         else:
-            device_model = build_robot_device_model(device_name, uuid)
+            device_model = build_robot_device_model(device_name, uuid, limits)
 
         self._adapter = ShdrAdapter(ShdrAdapterConfiguration(
             device=device_name,
@@ -789,7 +959,7 @@ class EquipmentSimulator:
             now = datetime.now(timezone.utc)
             for name, value in (("avail", "AVAILABLE"), ("estop", "ARMED"), ("cmode", "AUTOMATIC")):
                 self._enqueue_changed(name, value, now)
-            if self._equipment in (EquipmentType.MILL_3AXIS, EquipmentType.MILL_5AXIS_TRUNNION):
+            if self._equipment in (EquipmentType.MILL_3AXIS, EquipmentType.MILL_5AXIS_TRUNNION_BC):
                 self._enqueue_changed("Smode", "SPINDLE", now)
 
             cycle = self._spec.cycle_time
@@ -798,7 +968,7 @@ class EquipmentSimulator:
                 ts = datetime.now(timezone.utc)
                 if self._equipment == EquipmentType.MILL_3AXIS:
                     self._emit_mill(phase, ts)
-                elif self._equipment == EquipmentType.MILL_5AXIS_TRUNNION:
+                elif self._equipment == EquipmentType.MILL_5AXIS_TRUNNION_BC:
                     self._emit_mill5(phase, ts)
                 else:
                     self._emit_robot(phase, ts)
