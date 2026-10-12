@@ -1,9 +1,30 @@
 name: Release
 
+# Fires on EVERY push to release/* — see contributing.md → Triggering a release.
+#
+# THERE IS DELIBERATELY NO `paths:` FILTER. It used to be
+# `paths: ['src/__version__.py']`, which made a merge into a release branch a
+# SILENT no-op whenever the version had not changed: GitHub evaluates a push's
+# paths filter against a TWO-DOT diff of the push's before/after SHAs, so merging
+# main into release/0.1 while both tips carry the same version matched nothing,
+# queued no run, and reported nothing anywhere. A release that does not happen
+# must not look identical to one that was never asked for.
+#
+# Firing every time is cheap and safe because the DEDUPE ALREADY EXISTS one layer
+# down: the `version` job below sets should_release=false when the tag implied by
+# __version__ is already on the remote, and both build jobs are gated on it. So a
+# push that cannot release costs one ~15 s job and leaves a ::notice:: saying why
+# — visible, instead of silent.
+#
+# The flip side: a push to a release branch whose version is NOT yet tagged WILL
+# publish, whatever files it touched. What decides is tag state, not which paths
+# changed. `ci.yml`'s version-check refuses a PR into release/* whose version is
+# already tagged, so the mistake is caught before the merge rather than after it.
+#
+# No recursion: the tag push below is a TAG, and this trigger matches branches.
 on:
   push:
     branches: ['release/*']
-    paths: ['src/__version__.py']
   workflow_dispatch:
 
 permissions:
@@ -29,18 +50,10 @@ jobs:
 
           branch="${GITHUB_REF_NAME}"
 
-          # Read __version__ from src/__version__.py
-          version=$(grep -oP '"\K[^"]+' src/__version__.py)
-          if [ -z "$version" ]; then
-            echo "::error::Failed to parse __version__ from src/__version__.py"
-            exit 1
-          fi
-
-          # Validate semver
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::__version__ '$version' is not valid semver (expected MAJOR.MINOR.PATCH[-PRERELEASE])"
-            exit 1
-          fi
+          # Reads + semver-validates in one place, shared with ci.yml. Do NOT
+          # inline a parse here: the two inlined copies this replaced were both
+          # unanchored. See the script's header.
+          version=$(bash .github/scripts/read-version.sh)
 
           tag="v$version"
 
@@ -67,9 +80,19 @@ jobs:
           # On a `push` trigger, skip if the tag already exists on the remote — this
           # commit didn't actually bump the version (e.g. a revert or a no-op edit).
           # On `workflow_dispatch`, always proceed so broken releases can be re-run.
+          #
+          # THIS IS THE ONLY THING STOPPING A DUPLICATE RELEASE now that the
+          # trigger has no paths filter — both build jobs are gated on it. Assign
+          # first, then test: `git ls-remote ... | grep -q` would report "tag
+          # absent" for a NETWORK failure too (and `grep -q` exits early, so under
+          # `pipefail` a SIGPIPE'd producer can fail an otherwise-successful
+          # pipeline). With the assignment, `set -e` aborts the job if the query
+          # itself fails, which is the safe direction — a failed lookup must never
+          # read as "not released yet".
           should_release=true
           if [ "${{ github.event_name }}" = "push" ]; then
-            if git ls-remote --tags origin "refs/tags/$tag" | grep -q "refs/tags/$tag"; then
+            existing=$(git ls-remote --tags origin "refs/tags/$tag")
+            if [ -n "$existing" ]; then
               echo "::notice::Tag $tag already exists on remote — skipping (use workflow_dispatch to re-run)"
               should_release=false
             fi
@@ -166,7 +189,9 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q "refs/tags/$TAG"; then
+          # Assign-then-test, not `| grep -q` — see the note in the `version` job.
+          existing=$(git ls-remote --tags origin "refs/tags/$TAG")
+          if [ -n "$existing" ]; then
             echo "Tag $TAG already exists on remote — reusing"
           else
             git tag "$TAG"
@@ -192,7 +217,8 @@ jobs:
             echo "::notice::${{ needs.version.outputs.tag }} is a prerelease — $DEV is created on the first stable release, skipping"
             exit 0
           fi
-          if git ls-remote --heads origin "refs/heads/$DEV" | grep -q "refs/heads/$DEV"; then
+          existing=$(git ls-remote --heads origin "refs/heads/$DEV")   # see the `version` job
+          if [ -n "$existing" ]; then
             echo "::notice::$DEV already exists — leaving it untouched"
           else
             git config user.name "github-actions[bot]"
