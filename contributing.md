@@ -17,7 +17,7 @@ This document describes the branch model, version conventions, release process, 
 | Branch | Lifetime | Purpose |
 |---|---|---|
 | `main` | long-lived, protected | Staging area for the next minor release. All new features land here first. |
-| `release/X.Y` | long-lived, protected | Published release branch for version line `X.Y`. Pushes that modify `__version__` here trigger the release workflow and ship `vX.Y.Z`. |
+| `release/X.Y` | long-lived, protected | Published release branch for version line `X.Y`. Every push here runs the release workflow; it ships `vX.Y.Z` unless that tag already exists. |
 | `dev/X.Y` | long-lived, protected | Staging area for `X.Y.x` patches (`X.Y.1`, `X.Y.2`, …). Created automatically by the release workflow when the first stable `X.Y.0` ships. |
 | `feature/<short-name>` | short-lived | Feature work, branched off `main`, merged back via PR. |
 | `bugfix/<short-name>` | short-lived | Bug fixes for an existing release line, branched off `dev/X.Y`, merged back via PR. |
@@ -64,8 +64,8 @@ flowchart LR
     M -->|"cut + PR<br/>(new minor)"| RL["release/X.&lt;new&gt;<br/>(published)"]
     B["bugfix/&lt;name&gt;<br/>(short-lived)"] -->|PR| D["dev/X.Y<br/>(staging for X.Y patches)"]
     D -->|"PR<br/>(ships patch)"| RX["release/X.Y<br/>(published)"]
-    RX -.->|"__version__ change"| W["release.yml<br/>workflow"]
-    RL -.->|"__version__ change"| W
+    RX -.->|"any push"| W["release.yml<br/>workflow"]
+    RL -.->|"any push"| W
     W -->|"creates tag<br/>+ GitHub Release"| GR["v{__version__}"]
     W -.->|"creates on first<br/>stable X.Y.0"| D
 ```
@@ -76,13 +76,28 @@ Every published release flows through a staging branch (`main` for the next vers
 
 ### Triggering a release
 
-The workflow fires on **pushes to `release/*` branches that modify `src/__version__.py`**. The path
-    filter means non-version commits on a release branch (e.g. dependency bumps, doc fixes) do not
-    trigger a release.
+The workflow fires on **every push to a `release/*` branch**. What decides whether a release is
+    actually published is not which files the push touched, but whether the tag implied by
+    `__version__` already exists on the remote — if it does, the workflow skips itself in ~15
+    seconds with a `::notice::` and builds nothing.
+
+> **The trigger has no `paths` filter, deliberately.**
+>
+> It used to fire only on pushes that modified `src/__version__.py`. That made merging `main` into
+>     `release/0.1` *without* a version bump a **completely silent no-op** — GitHub evaluates a
+>     push's `paths` filter against a two-dot diff of the push's before/after SHAs, so when both tips
+>     carried the same version the filter matched nothing, no run was queued, and nothing was
+>     reported anywhere. A release that does not happen must not look identical to one that was
+>     never requested.
+>
+> ⚠️ **Consequence:** a push to a release branch whose version is **not yet tagged** will publish,
+>     whatever files it touched. Doc fixes and dependency bumps are no longer automatically
+>     release-free — land them on `main` (or after the release) rather than on a release branch
+>     sitting at an unreleased version.
 
 ```mermaid
 flowchart LR
-    A["PR merge to release/0.1<br/>bumping __version__ to 0.1.1"] -->|push| B["release.yml<br/>workflow"]
+    A["PR merge to release/0.1<br/>(any push)"] -->|push| B["release.yml<br/>workflow"]
     B --> C{"Tag v0.1.1<br/>already exists?"}
     C -->|yes| Skip["Skip — already released"]
     C -->|no| D["build-linux + build-windows"]
@@ -98,6 +113,39 @@ Before building, the workflow validates two things:
 - **`__version__` is valid semver** (`MAJOR.MINOR.PATCH[-PRERELEASE]`).
 - **The branch name matches the version's `X.Y`** — `release/0.1` must hold a `0.1.x` version, not
     `0.2.x`. This catches the "merged the wrong PR into the wrong branch" mistake.
+
+The PR gate checks two more things, **before** the merge:
+
+- **A PR into `main`, `dev/X.Y` or `release/X.Y` whose `__version__` is already tagged on the remote is
+    refused.**
+    A released version must never be the *current* version on a staging or release branch. Into
+    `release/*`, merging it could only produce a run that skips itself. Into `main`, the stale
+    number would ride the next forward-merge into `release/*` and silently produce nothing there.
+    Refusing it at the door is what stops a released version from trickling anywhere.
+- ⚠️ **Two consequences.** The first PR into `main` after a release must carry the version bump —
+    until someone bumps it, `main` sits at a released version and the gate stays red. And syncing a
+    release branch with `main` *without* releasing is no longer a single merge: bump the version, or
+    push the sync commits some other way.
+
+Every protected branch is covered: `main`, `dev/X.Y` and `release/X.Y`. `dev/X.Y` is the `main` of
+    its patch line, so the same reasoning applies one level down — a fix landing on `dev/1.0` while
+    it still reads `1.0.0` would forward into `release/1.0` and release nothing.
+
+**Only the first PR after a release has to bump.** Once a branch reads an unreleased version, later
+    PRs onto it pass without bumping again, so several fixes accumulate under one pending number —
+    which is what ships when the branch is forwarded. Concretely, after `v1.0.0`:
+
+| PR | Version on the branch | Gate |
+|---|---|---|
+| bugfix A into `dev/1.0`, no bump | `1.0.0` (released) | ❌ refused — bump it |
+| bugfix A into `dev/1.0`, bumped | `1.0.1` | ✅ |
+| bugfix B into `dev/1.0`, no bump needed | `1.0.1` | ✅ |
+| bugfix C into `dev/1.0`, no bump needed | `1.0.1` | ✅ |
+| `dev/1.0` → `release/1.0` | `1.0.1` | ✅ ships `v1.0.1` with A + B + C |
+| bugfix D into `dev/1.0`, no bump | `1.0.1` (now released) | ❌ refused — bump to `1.0.2` |
+
+Short-lived branches (`feature/*`, `bugfix/*`, `forwardport/*`) are not PR targets, so nothing
+    changes for them.
 
 If the tag implied by `__version__` already exists on the remote, the workflow skips (preventing
     re-runs on a non-version commit, or on the same commit being pushed twice). To re-run a release
@@ -274,7 +322,9 @@ If multi-commit forward-ports become routine, consider configuring `dev/*` to us
     merge** for bugfix PRs — every bugfix then lands on the dev branch as a single commit, and
     forward-porting is always a single `git cherry-pick`. Trade-off: the granular history of how
     the fix was built up is collapsed. If you also want to keep the `__version__` bump out of the
-    squashed commit, split the bugfix into two PRs (fix-only, then bump).
+    squashed commit, split the bugfix into two PRs — but **bump first, then fix**. The version
+    gate refuses a PR onto `dev/X.Y` while the branch still reads the version that just
+    shipped, so a fix-only PR is red until the bump has landed. Reversing the order avoids it.
 
 
 ## Creating a new release
@@ -365,8 +415,8 @@ Protection is configured with **Rulesets** (Settings → Rules → Rulesets), no
 
 | Setting | Value |
 |---|---|
-| Allow merge commits | true (Default message) |
-| Allow squash merging | true (Default message) |
+| Allow merge commits | true (Pull request title) |
+| Allow squash merging | true (Pull request title) |
 | Allow rebase merging | true |
 
 All three are enabled because a ruleset can only *narrow* the allowed merge methods, never add one.
@@ -466,7 +516,7 @@ This overlays `release/*` with the rules that should be **admin-bypassable**. Re
 | Require status checks to pass | true |
 | Require branches to be up to date before merging | true |
 | Do not require status checks on creation | false |
-| Status checks that are required | [build-windows, build-linux] |
+| Status checks that are required | [build-windows, build-linux, version-check] |
 | Block force pushes | true |
 
 Rationale:
@@ -508,12 +558,37 @@ Rationale:
 ### Pre-merge build check (`ci.yml`)
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on **`pull_request` events targeting
-    `main`, `dev/*`, and `release/*`**. It builds the app on both shipped platforms (`build-linux`
-    via `make`, `build-windows` via `build.bat ci`) and fails if the binary isn't produced — catching
-    build, packaging, and import breakage *before* a PR merges. It does **not** package or upload
-    artifacts, and it doesn't run the integration loopback test in [`src/test.py`](src/test.py). It
-    also runs `version-check`, which is a no-op unless the PR targets `release/*` (above). Required
-    status-check names appear in a ruleset's search box after the workflow has run once on a PR.
+    `main`, `dev/*`, and `release/*`**, with four jobs:
+
+| Job | What it does |
+|---|---|
+| `build-linux` | The **complete** Linux release build, via the shared [`build-linux`](.github/actions/build-linux/action.yml) composite action: `make` → binary assertion → third-party notices → `tar.gz` → archive assertions. |
+| `build-windows` | The same for Windows, via [`build-windows`](.github/actions/build-windows/action.yml): `build.bat ci` → `.exe` assertion → notices → `.zip` → archive assertions. |
+| `test` | `pytest tests` against a venv built from `requirements-src.txt`. Tests needing the bundled MTConnect agent binary self-skip when `src/bin/agent` is absent. Not a required status check. |
+| `version-check` | Always validates that `__version__` parses and is semver. For PRs into `main`, `dev/X.Y` *or* `release/X.Y` it also refuses a version that is already released; for `release/*` it additionally checks the `X.Y` line against the branch (above). |
+
+> **⭐ The gate runs the release build, not a cheaper approximation of it.**
+>
+> It used to stop after the binary existed — the third-party notices and the `tar.gz`/`.zip`
+>     packaging were **release-only**. That meant a packaging break was first seen *after* the merge
+>     into `release/X.Y`, when the version is already spent and the fix costs another bump and
+>     another merge. [`packaging/generate_notices.py`](packaging/generate_notices.py) is the live
+>     hazard: it walks installed package metadata, so a new dependency with missing or malformed
+>     metadata breaks it — a change the old gate passed happily.
+>
+> The build now lives in **one composite action per OS**, shared verbatim with `release.yml`; only
+>     the artifact upload is release-specific. Both actions derive the archive name from the same
+>     version reader, so the gate names artifacts exactly as the release will. Cost: the gate is
+>     slower by the packaging time.
+
+`version-check` reads the version through
+    [`.github/scripts/read-version.sh`](.github/scripts/read-version.sh) rather than inlining a
+    parse; `release.yml` and both composite actions call the same script. That is deliberate — the
+    two workflows used to carry their own copy of the parse, and two copies of a parse drift.
+    Required status-check names appear in a ruleset's search box after the workflow has run once on
+    a PR.
+
+The gate still does not run the integration loopback test in [`src/test.py`](src/test.py).
 
 The release workflow itself is **not** a required status check: it runs *after* merge (its trigger
     is the resulting push to `release/*`), so it can't be a pre-merge gate — which is exactly why

@@ -21,9 +21,9 @@ A future ``buildFromModel(url, rig)`` can return the same shape (loading a
 
 import functools
 import json
+from datetime import datetime
 from pathlib import Path
-
-from .simulator import RoutineSpec
+from typing import Any, Dict, Optional, Union
 
 _STATIC = Path(__file__).parent / "static"
 
@@ -33,21 +33,37 @@ def _read_static(name: str) -> str:
     return (_STATIC / name).read_text(encoding="utf-8")
 
 
-def render_equipment_html(spec: RoutineSpec, start_epoch: float, height: int = 540) -> str:
+def render_equipment_html(
+    spec: Union[Dict[str, Any], Any],
+    start_epoch: float,
+    server_time: Optional[Union[str, datetime]] = None,
+    height: int = 540,
+) -> str:
     """Return a self-contained HTML page animating ``spec``, phase-locked to the wall clock.
 
-    ``start_epoch`` is the simulator's Unix start time (``EquipmentSimulator.start_epoch``).
-    The page derives the current cycle phase from ``Date.now()`` every frame, exactly as the
-    simulator derives it from ``time.time()`` — so the animation stays in sync with the
-    emitted data with no drift, regardless of how long the iframe took to load or whether the
-    tab was backgrounded. (The previous ``phase0`` snapshot advanced by ``performance.now()``
-    started behind by the iframe's load time and drifted while backgrounded, which is why
-    closing and reopening the view "fixed" it — it recaptured a fresh phase.)
+    ``spec`` is a ``RoutineSpec.to_dict()`` mapping — the exact object returned by
+    ``GET /simulate/sessions/{id}/routine`` — (a live ``RoutineSpec`` is also accepted).
+    ``start_epoch`` is the simulator's Unix start time. The page derives the current cycle
+    phase from ``Date.now()`` every frame, exactly as the simulator derives it from
+    ``time.time()`` — so the animation stays in sync with the emitted data with no drift,
+    regardless of how long the iframe took to load or whether the tab was backgrounded.
+    (The previous ``phase0`` snapshot advanced by ``performance.now()`` started behind by
+    the iframe's load time and drifted while backgrounded, which is why closing and
+    reopening the view "fixed" it — it recaptured a fresh phase.)
+
+    ``server_time`` (the routine endpoint's response timestamp) lets the page correct for
+    browser↔backend clock skew: the JS computes ``offset = Date.now() − server_time`` once
+    at load and subtracts it every frame, keeping the phase-lock exact even when the UI
+    runs on a different machine than the backend. ~0 (network latency) on localhost.
     """
+    spec_dict: Dict[str, Any] = spec.to_dict() if hasattr(spec, "to_dict") else dict(spec)
+    if isinstance(server_time, datetime):
+        server_time = server_time.isoformat()
     payload = json.dumps({
-        "spec": spec.to_dict(),
+        "spec": spec_dict,
         "start_epoch": float(start_epoch),
-        "cycle": spec.cycle_time,
+        "cycle": float(spec_dict["cycle_time"]),
+        "server_time": server_time,
     })
     return (
         _HTML_TEMPLATE
@@ -103,6 +119,11 @@ try {
 
   var spec = DATA.spec;
   var CYCLE = DATA.cycle;
+  // Browser−backend clock skew, captured once at load (includes the iframe's
+  // delivery latency, which is negligible). Subtracted from Date.now() every
+  // frame so the phase-lock holds even against a remote backend; ~0 locally.
+  var CLOCK_OFFSET_MS = DATA.server_time ? (Date.now() - Date.parse(DATA.server_time)) : 0;
+  if (!isFinite(CLOCK_OFFSET_MS)) CLOCK_OFFSET_MS = 0;
   var wrap = document.getElementById('wrap');
   var W = wrap.clientWidth || 640, H = wrap.clientHeight || __HEIGHT__;
 
@@ -173,24 +194,28 @@ try {
 
   // ---- machine builders --------------------------------------------------
   var MACHINES = {
-    MILL_3AXIS: function(){
-      var g = spec.geometry, wk = g.work;
+    mill_3axis: function(){
+      // g.env is the CONFIGURED travel envelope (per-axis limits); the work
+      // box, toolpath, and stock were scaled into it server-side.
+      var g = spec.geometry, wk = g.work, env = g.env;
       var cx = (wk.x0 + wk.x1) / 2, cy = (wk.y0 + wk.y1) / 2;
+      var ex = env.x1 - env.x0, ey = env.y1 - env.y0;
+      var ecx = (env.x0 + env.x1) / 2, ecy = (env.y0 + env.y1) / 2;
       var toolR = (g.tool_dia || 50) / 2;
       var root = new THREE.Group();
 
-      // Fixed floor grid (X-Y plane).
-      var grid = new THREE.GridHelper(g.limit, 20, 0x3a3f4b, 0x2a2e38);
+      // Fixed floor grid (X-Y plane), sized/centered on the configured envelope.
+      var grid = new THREE.GridHelper(Math.max(ex, ey), 20, 0x3a3f4b, 0x2a2e38);
       grid.rotation.x = Math.PI / 2;
-      grid.position.set(g.limit / 2, g.limit / 2, 0);
+      grid.position.set(ecx, ecy, 0);
       root.add(grid);
 
       // Fixed vertical gantry (portal): legs at the X-envelope edges (clear of
       // the sliding table) with a top beam; the spindle head rides up/down on it.
       var zBeam = wk.z_safe + 200, gmat = 0x565d6b;
       function leg(px){ var m = box(45, 45, zBeam, gmat); m.position.set(px, cy, zBeam / 2); root.add(m); }
-      leg(0); leg(g.limit);
-      var beam = box(g.limit + 90, 60, 60, gmat); beam.position.set(cx, cy, zBeam); root.add(beam);
+      leg(env.x0); leg(env.x1);
+      var beam = box(ex + 90, 60, 60, gmat); beam.position.set(ecx, cy, zBeam); root.add(beam);
 
       // Moving table (plate) carrying the workpiece; translates in X/Y so the
       // cut point stays under the fixed tool.
@@ -221,23 +246,26 @@ try {
       };
     },
 
-    MILL_5AXIS_TRUNNION: function(){
+    mill_5axis_trunnion_bc: function(){
       // 5-axis trunnion: the head carries X/Y/Z (tool tip = commanded x/y/z in
       // world), while the table tilts about Y (B1) then rotates about Z (C1).
       // Nesting root -> trunnion(rot Y) -> table(rot Z) -> stock reproduces the
       // physical chain, so the tool tip transformed into the table's local frame
       // (worldToLocal) engraves the toolpath on the tilting/rotating part.
-      var g = spec.geometry, wk = g.work;
+      var g = spec.geometry, env = g.env;
       var piv = g.pivot;                          // [cx, cy, pz]
       var cx = piv[0], cy = piv[1], pz = piv[2];
-      var half = g.half, sh = g.stock_h;
+      // Stock half-widths per axis (the configured limits scale X and Y
+      // independently, so the stock can be rectangular) + height.
+      var hx = g.half_x, hy = g.half_y, sh = g.stock_h;
       var toolR = (g.tool_dia || 50) / 2;
       var root = new THREE.Group();
 
-      // Fixed floor grid (X-Y plane).
-      var grid = new THREE.GridHelper(g.limit, 20, 0x3a3f4b, 0x2a2e38);
+      // Fixed floor grid (X-Y plane), sized/centered on the configured envelope.
+      var ex = env.x1 - env.x0, ey = env.y1 - env.y0;
+      var grid = new THREE.GridHelper(Math.max(ex, ey), 20, 0x3a3f4b, 0x2a2e38);
       grid.rotation.x = Math.PI / 2;
-      grid.position.set(g.limit / 2, g.limit / 2, 0);
+      grid.position.set((env.x0 + env.x1) / 2, (env.y0 + env.y1) / 2, 0);
       root.add(grid);
 
       // Trunnion cradle — tilts about Y (B1) about the pivot. Two bearing side
@@ -246,19 +274,20 @@ try {
       var trunnion = new THREE.Group();
       trunnion.position.set(cx, cy, pz);
       root.add(trunnion);
-      var armY = half + 70, sideMat = 0x4b5160, trunOpacity = 0.25;
-      var s1 = box(half * 2 + 60, 26, half * 2 + 40, sideMat, trunOpacity); s1.position.set(0, armY, 0); trunnion.add(s1);
-      var s2 = box(half * 2 + 60, 26, half * 2 + 40, sideMat, trunOpacity); s2.position.set(0, -armY, 0); trunnion.add(s2);
-      var yoke = box(half * 2 + 60, armY * 2, 28, sideMat, trunOpacity); yoke.position.set(0, 0, -(sh / 2 + 46)); trunnion.add(yoke);
+      var armY = hy + 70, sideMat = 0x4b5160, trunOpacity = 0.25;
+      var sideH = Math.max(hx * 2, sh) + 40;
+      var s1 = box(hx * 2 + 60, 26, sideH, sideMat, trunOpacity); s1.position.set(0, armY, 0); trunnion.add(s1);
+      var s2 = box(hx * 2 + 60, 26, sideH, sideMat, trunOpacity); s2.position.set(0, -armY, 0); trunnion.add(s2);
+      var yoke = box(hx * 2 + 60, armY * 2, 28, sideMat, trunOpacity); yoke.position.set(0, 0, -(sh / 2 + 46)); trunnion.add(yoke);
 
       // Rotary table — spins about Z (C1) within the tilted cradle; carries the
       // round table plate and the stock, both centered on the pivot.
       var table = new THREE.Group();
       trunnion.add(table);
-      var plate = zCylinder(half + 34, 26, 0x3f4552);
+      var plate = zCylinder(Math.max(hx, hy) + 34, 26, 0x3f4552);
       plate.position.set(0, 0, -(sh / 2 + 26));
       table.add(plate);
-      var stock = box(half * 2, half * 2, sh, 0xe8ecf2, 0.92);
+      var stock = box(hx * 2, hy * 2, sh, 0xe8ecf2, 0.92);
       stock.position.set(0, 0, 0);
       table.add(stock);
 
@@ -290,7 +319,7 @@ try {
       };
     },
 
-    ROBOT_6DOF: function(){
+    robot_6dof: function(){
       var g = spec.geometry, links = g.links;
       var root = new THREE.Group();
 
@@ -411,7 +440,7 @@ try {
     // Phase-locked to wall clock (Date.now) — the same reference the simulator uses
     // (time.time()) — recomputed every frame, so the animation never drifts from the
     // emitted data regardless of iframe load time or tab backgrounding.
-    var phase = ((((Date.now() / 1000) - DATA.start_epoch) % CYCLE) + CYCLE) % CYCLE;
+    var phase = (((((Date.now() - CLOCK_OFFSET_MS) / 1000) - DATA.start_epoch) % CYCLE) + CYCLE) % CYCLE;
     var st = coords(phase);
     var tip = machine.apply(st);
 
@@ -432,9 +461,9 @@ try {
 
     var m = st.meta || {};
     var label;
-    if (spec.equipment === 'MILL_3AXIS'){
+    if (spec.equipment === 'mill_3axis'){
       label = 'MILL  ' + (m.prog || '') + '\nX ' + fmt(st.pos[0]) + '  Y ' + fmt(st.pos[1]) + '  Z ' + fmt(st.pos[2]) + ' mm';
-    } else if (spec.equipment === 'MILL_5AXIS_TRUNNION'){
+    } else if (spec.equipment === 'mill_5axis_trunnion_bc'){
       label = 'MILL 5X  ' + (m.prog || '') + '  [' + (m.rmode || '') + ']'
             + '\nX ' + fmt(st.pos[0]) + '  Y ' + fmt(st.pos[1]) + '  Z ' + fmt(st.pos[2]) + ' mm'
             + '\nB ' + fmt(st.pos[3]) + '  C ' + fmt(st.pos[4]) + ' deg';

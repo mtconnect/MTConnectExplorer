@@ -1,4 +1,5 @@
 import os
+import json
 import unicodedata
 import string
 import logging
@@ -324,8 +325,19 @@ class MtConnectDatasetReader:
     def is_finished(self) -> bool:
         return self._reader.is_finished
 
+    @property
+    def next_offset(self) -> Optional[int]:
+        """Byte offset of the next frame to read (for the seek keyframe index)."""
+        return self._reader.next_offset
+
     def open(self, path: str) -> "MtConnectDatasetReader":
         self._reader.open(path)
+        return self
+
+    def open_at(self, path: str, offset: int) -> "MtConnectDatasetReader":
+        """Open positioned at a specific frame byte offset (an observation frame,
+        not the probe) — used to resume delta replay from an indexed snapshot."""
+        self._reader.open_at(path, offset)
         return self
 
     def close(self) -> None:
@@ -356,9 +368,127 @@ class MtConnectDatasetReader:
         return data_frame.timestamp, shdr_obs
     
 
+def dataset_duration(file_path: str) -> float:
+    """Total playback span, in seconds, of a RawMTConnect-v0.1 dataset — from the
+    first observation frame (the frame after the leading probe) to the last frame.
+
+    This matches the span the player replays in one pass (``pass_frame_start`` in
+    ``_loop`` is the first post-probe frame). Returns 0.0 for an empty or
+    probe-only dataset. The reader is forward-only with no index, so duration is
+    not known during playback; this pre-scans the file, but parses only the two
+    boundary lines' timestamps (not every frame's payload), so it stays cheap on
+    large files."""
+    def _ts(line: str) -> datetime:
+        return datetime.fromisoformat(json.loads(line)["TIMESTAMP"])
+
+    with open(file_path, "r") as f:
+        f.readline()                    # header
+        f.readline()                    # probe frame (first data line) — skipped
+        start_line = f.readline()       # first observation frame = pass start
+        if not start_line.strip():
+            return 0.0
+        last_line = start_line
+        for line in f:
+            if line.strip():
+                last_line = line
+    return max((_ts(last_line) - _ts(start_line)).total_seconds(), 0.0)
+
+
+class _DeviceStateFold:
+    """Accumulates a single device's full observation state so it can be re-emitted
+    as a ``/current``-equivalent snapshot. Used to build the seek keyframe index:
+    replaying every observation from the start folds into this, and a snapshot taken
+    at time T is the exact device state at T (SHDR observations that, emitted to a
+    fresh/uncertain agent, reconstruct that state).
+
+    Cumulative semantics mirror the agent: values/time-series are last-wins;
+    conditions keep the active set per native code (a code-less NORMAL clears all);
+    DATA_SET/TABLE accumulate with reset + per-entry delete; assets add/remove."""
+
+    def __init__(self) -> None:
+        self.values: Dict[str, ShdrDataItem] = {}
+        self.time_series: Dict[str, ShdrTimeSeries] = {}
+        # name -> {native_code (""=no code) -> condition}. Empty dict == all NORMAL.
+        self.conditions: Dict[str, Dict[str, ShdrCondition]] = {}
+        self.data_sets: Dict[str, Dict[str, Any]] = {}
+        self.tables: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self.assets: Dict[str, ShdrAsset] = {}
+
+    def apply(self, obs: ShdrObservation) -> None:
+        if isinstance(obs, ShdrDataItem):
+            self.values[obs.name] = obs
+        elif isinstance(obs, ShdrTimeSeries):
+            self.time_series[obs.name] = obs
+        elif isinstance(obs, ShdrCondition):
+            codes = self.conditions.setdefault(obs.name, {})
+            code = obs.native_code or ""
+            if obs.level == ShdrConditionLevel.NORMAL:
+                if code:
+                    codes.pop(code, None)  # NORMAL for a code clears that code
+                else:
+                    codes.clear()          # code-less NORMAL clears all
+            elif obs.level == ShdrConditionLevel.UNAVAILABLE:
+                codes.clear()
+                codes["\x00unavail"] = obs
+            else:  # WARNING / FAULT
+                codes.pop("\x00unavail", None)
+                codes[code] = obs
+        elif isinstance(obs, ShdrDataSet):
+            cur = self.data_sets.setdefault(obs.name, {})
+            if obs.reset_triggered:
+                cur.clear()
+            for k, v in obs.entries.items():
+                if v is None or v == "":
+                    cur.pop(k, None)
+                else:
+                    cur[k] = v
+        elif isinstance(obs, ShdrTable):
+            cur = self.tables.setdefault(obs.name, {})
+            if obs.reset_triggered:
+                cur.clear()
+            for rk, cells in obs.rows.items():
+                if not cells:
+                    cur.pop(rk, None)
+                else:
+                    cur[rk] = dict(cells)
+        elif isinstance(obs, ShdrAsset):
+            self.assets[obs.asset_id] = obs
+        elif isinstance(obs, ShdrRemoveAsset):
+            self.assets.pop(obs.asset_id, None)
+        elif isinstance(obs, ShdrRemoveAllAssets):
+            self.assets = {
+                aid: a for aid, a in self.assets.items() if a.asset_type != obs.asset_type
+            }
+
+    def snapshot(self) -> List[ShdrObservation]:
+        """A fresh list of timestamp-less observations that reconstructs the current
+        state when emitted (timestamps are assigned by the player at emit time)."""
+        out: List[ShdrObservation] = []
+        for v in self.values.values():
+            out.append(v.model_copy(update={"timestamp": None}))
+        for ts in self.time_series.values():
+            out.append(ts.model_copy(update={"timestamp": None}))
+        for name, codes in self.conditions.items():
+            # Clear any stale agent state for this condition first, then set actives.
+            out.append(ShdrCondition(name=name, level=ShdrConditionLevel.NORMAL))
+            for c in codes.values():
+                out.append(c.model_copy(update={"timestamp": None}))
+        for name, entries in self.data_sets.items():
+            out.append(ShdrDataSet(name=name, entries=dict(entries), reset_triggered="MANUAL"))
+        for name, rows in self.tables.items():
+            out.append(ShdrTable(
+                name=name,
+                rows={rk: dict(cells) for rk, cells in rows.items()},
+                reset_triggered="MANUAL",
+            ))
+        for a in self.assets.values():
+            out.append(a.model_copy(update={"timestamp": None}))
+        return out
+
+
 class MtConnectDatasetPlayer:
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 7878, re_timestamp: bool = True, loop: bool = True, thread_name: str = "dataset-player"):
+    def __init__(self, host: str = "127.0.0.1", port: int = 7878, re_timestamp: bool = True, loop: bool = True, thread_name: str = "dataset-player", snapshot_interval_s: float = 15.0):
         if not isinstance(host, str):
             raise TypeError("host must be a str")
         self._host = host
@@ -389,6 +519,13 @@ class MtConnectDatasetPlayer:
         # NB: not named ``self._loop`` so it does not shadow the _loop() method.
         self._loop_enabled = loop
 
+        if not isinstance(snapshot_interval_s, (int, float)) or snapshot_interval_s <= 0:
+            raise ValueError("snapshot_interval_s must be a positive number")
+        # Keyframe cadence (dataset seconds): a full-state snapshot is indexed every
+        # this-many seconds so a seek replays only from the nearest snapshot, not
+        # from the top. Set at construction, fixed for the session.
+        self._snapshot_interval_s = float(snapshot_interval_s)
+
         self._file_path: Optional[str] = None
         self._device_name: Optional[str] = None
         self._reader: Optional[MtConnectDatasetReader] = None
@@ -398,9 +535,116 @@ class MtConnectDatasetPlayer:
         self._is_alive = False
         self._is_finished = False
 
+        # Total dataset span (seconds), computed at open(); the scrub bar's range.
+        self._duration: float = 0.0
+
+        # Seek keyframe index, built once at open(): sorted list of
+        # (snapshot_time_s, file_byte_offset, snapshot_observations). snapshot_time_s
+        # is dataset in-pass time; the observations reconstruct full device state as
+        # of just-before that time; file_byte_offset points at the first frame at/after
+        # it (where delta replay resumes). _pass_frame_start is the dataset timestamp
+        # of in-pass offset 0 (so frame_offset = frame_ts - _pass_frame_start).
+        self._snapshots: List[Tuple[float, int, List[ShdrObservation]]] = []
+        self._pass_frame_start: Optional[datetime] = None
+
+        # --- Playhead (target) clock: what pause freezes and the UI reads ----------
+        # The playhead advances at 1x wall-clock while playing, is frozen while
+        # paused, and is set directly by a seek. Modelled as an anchor:
+        #   target(now) = _pos_anchor + (now - _wall_anchor)   [playing]
+        #   target      = _pos_anchor                          [paused]
+        # A frame at in-pass offset O is emitted once target >= O: unpaced when
+        # behind (post-seek catch-up), paced when caught up. Pause never blocks the
+        # emit loop — it only stops the target advancing, so an in-flight catch-up
+        # runs to the (now frozen) target and then idles.
+        self._pos_anchor: float = 0.0
+        self._wall_anchor: Optional[datetime] = None
+        self._paused: bool = False
+
+        # --- Emit-timestamp clock (re_timestamp): kept separate from the playhead --
+        # so a backward seek/loop-wrap never emits a decreasing timestamp (the agent
+        # rejects those). Emitted ts = _emit_origin + _elapsed_offset + frame_offset,
+        # with a monotonic guard. _elapsed_offset accumulates completed passes.
+        self._emit_origin: Optional[datetime] = None
+        self._elapsed_offset: timedelta = timedelta(0)
+        self._last_emit_ts: Optional[datetime] = None
+
+        # Pending seek target (in-pass seconds); latest-wins, applied by _loop.
+        self._seek_target: Optional[float] = None
+        self._seek_lock = threading.Lock()
+
     @property
     def is_finished(self) -> bool:
         return self._is_finished
+
+    @property
+    def duration(self) -> float:
+        """Total dataset span in seconds (the scrub range)."""
+        return self._duration
+
+    def _clamp(self, pos: float) -> float:
+        return min(max(pos, 0.0), self._duration) if self._duration else max(0.0, pos)
+
+    def _target_pos(self, now: Optional[datetime] = None) -> float:
+        """In-pass playhead target (seconds): advances with wall-clock while
+        playing, frozen while paused. Not clamped (the loop wraps at duration)."""
+        if self._wall_anchor is None:
+            return 0.0
+        if self._paused:
+            return self._pos_anchor
+        now = now or datetime.now(timezone.utc)
+        return self._pos_anchor + (now - self._wall_anchor).total_seconds()
+
+    @property
+    def pass_start_epoch(self) -> Optional[float]:
+        """Unix time corresponding to offset 0 of the current pass, or None until
+        playback has started. The UI computes the live playhead as
+        ``now - pass_start_epoch`` (except while paused — see ``paused``/``position``),
+        so this is republished on start, loop-wrap, seek, and pause/resume."""
+        if self._wall_anchor is None:
+            return None
+        return self._wall_anchor.timestamp() - self._pos_anchor
+
+    @property
+    def position(self) -> float:
+        """Current playhead within the pass, in seconds (clamped to [0, duration]).
+        Frozen while paused (the target stops advancing)."""
+        if self._wall_anchor is None:
+            return 0.0
+        return self._clamp(self._target_pos())
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    def pause(self) -> None:
+        """Freeze the playhead target (no-op if already paused). Does NOT block the
+        emit loop — a post-seek fast-forward keeps releasing data up to the frozen
+        target and then idles. Works in any timestamp mode (pause does not rewind)."""
+        with self._seek_lock:
+            if self._paused:
+                return
+            self._pos_anchor = self._clamp(self._target_pos())
+            self._wall_anchor = datetime.now(timezone.utc)
+            self._paused = True
+
+    def resume(self) -> None:
+        """Resume (no-op if not paused): the target advances again from where it was."""
+        with self._seek_lock:
+            if not self._paused:
+                return
+            self._wall_anchor = datetime.now(timezone.utc)
+            self._paused = False
+
+    def seek(self, offset_seconds: float) -> None:
+        """Request a seek to ``offset_seconds`` into the dataset (latest-wins).
+
+        Applied by the playback thread: it jumps to the nearest indexed snapshot at
+        or before the target, emits that full-state snapshot, then fast-forwards the
+        remaining (≤ snapshot interval) deltas to the target and resumes paced
+        playback. Only valid with re_timestamp on (the caller enforces this)."""
+        target = self._clamp(float(offset_seconds))
+        with self._seek_lock:
+            self._seek_target = target
 
     def open(self, file_path: str, device_name: str, autoplay: bool = True) -> "MtConnectDatasetPlayer":
         if not isinstance(file_path, str):
@@ -417,6 +661,12 @@ class MtConnectDatasetPlayer:
 
         self._file_path = file_path
         self._device_name = device_name
+        self._duration = dataset_duration(file_path)
+
+        # Build the seek keyframe index (one pre-scan pass over this device's frames)
+        # so a later scrub replays only from the nearest snapshot, not from the top.
+        self._build_snapshot_index()
+
         self._reader = MtConnectDatasetReader(device_name).open(file_path)
         self._adapter = ShdrAdapter(
             ShdrAdapterConfiguration(
@@ -430,11 +680,45 @@ class MtConnectDatasetPlayer:
         if autoplay:
             self.play()
         return self
+
+    def _build_snapshot_index(self) -> None:
+        """One pre-scan pass: fold every observation into running device state and
+        record a full-state snapshot every ``_snapshot_interval_s`` of dataset time.
+        Each entry is (snapshot_time_s, byte_offset_of_first_frame_at/after_it,
+        snapshot_observations); the snapshot is the state strictly before that frame,
+        so a seek emits it then replays the ≤interval remaining deltas to the target."""
+        reader = MtConnectDatasetReader(self._device_name).open(self._file_path)
+        try:
+            reader.read_probe_device_model()  # consume the probe/device-model frame
+            fold = _DeviceStateFold()
+            snapshots: List[Tuple[float, int, List[ShdrObservation]]] = []
+            interval = self._snapshot_interval_s
+            next_snap = interval
+            pass_frame_start: Optional[datetime] = None
+            while not reader.is_finished:
+                byte_offset = reader.next_offset
+                frame_timestamp, obs_list = reader.read()
+                if pass_frame_start is None:
+                    pass_frame_start = frame_timestamp
+                off = (frame_timestamp - pass_frame_start).total_seconds()
+                while off >= next_snap:
+                    snapshots.append((next_snap, byte_offset, fold.snapshot()))
+                    next_snap += interval
+                for o in obs_list:
+                    fold.apply(o)
+            self._snapshots = snapshots
+            self._pass_frame_start = pass_frame_start
+            logger.debug(
+                "Built %d seek snapshot(s) at %.0fs spacing for '%s'",
+                len(snapshots), interval, self._device_name,
+            )
+        finally:
+            reader.close()
     
     def play(self) -> None:
         if self._reader is None or self._adapter is None:
             raise RuntimeError("Not opened")
-        
+
         self._is_alive = False
         self._is_finished = False
         self._thread = threading.Thread(
@@ -454,52 +738,146 @@ class MtConnectDatasetPlayer:
             self._adapter.stop()
             self._adapter = None
 
+    def _reopen_reader(self) -> "MtConnectDatasetReader":
+        """Close the current reader and open a fresh one positioned at the first
+        observation frame (probe discarded) — used for loop-wrap and for a seek to a
+        target before the first snapshot, since the reader is forward-only."""
+        if self._reader is not None:
+            try:
+                self._reader.close()
+            except Exception:
+                pass
+        reader = MtConnectDatasetReader(self._device_name).open(self._file_path)
+        reader.read_probe_device_model()  # discard device-model (probe) line
+        self._reader = reader
+        return reader
+
+    def _reopen_reader_at(self, byte_offset: int) -> "MtConnectDatasetReader":
+        """Reopen the reader positioned at an indexed frame byte offset (a snapshot's
+        resume point), skipping everything before it."""
+        if self._reader is not None:
+            try:
+                self._reader.close()
+            except Exception:
+                pass
+        self._reader = MtConnectDatasetReader(self._device_name).open_at(
+            self._file_path, byte_offset
+        )
+        return self._reader
+
+    def _emit_ts(self, frame_offset: float) -> datetime:
+        """Next emit timestamp (re_timestamp mode): emit_origin + elapsed + offset,
+        with a strictly-increasing guard so a backward seek/loop-wrap never emits a
+        decreasing timestamp (the agent rejects those)."""
+        ts = self._emit_origin + self._elapsed_offset + timedelta(seconds=frame_offset)
+        if self._last_emit_ts is not None and ts <= self._last_emit_ts:
+            ts = self._last_emit_ts + timedelta(milliseconds=1)
+        self._last_emit_ts = ts
+        return ts
+
+    def _emit_observations(self, obs_list: List[ShdrObservation], frame_offset: float) -> None:
+        if not obs_list:
+            return
+        if self._re_timestamp:
+            new_ts = self._emit_ts(frame_offset)
+            obs_list = [o.model_copy(update={"timestamp": new_ts}) for o in obs_list]
+        self._adapter.enqueue(obs_list)
+
+    def _snapshot_at(self, target: float) -> Optional[Tuple[float, int, List[ShdrObservation]]]:
+        """The indexed snapshot with the greatest time ≤ target, or None if target is
+        before the first snapshot (replay from the top)."""
+        chosen: Optional[Tuple[float, int, List[ShdrObservation]]] = None
+        for snap in self._snapshots:
+            if snap[0] <= target:
+                chosen = snap
+            else:
+                break
+        return chosen
+
+    def _apply_seek(self, target: float) -> None:
+        """Seek to in-pass offset ``target`` via the keyframe index: jump to the
+        nearest snapshot ≤ target, emit its full state, and let the loop fast-forward
+        the remaining (≤ interval) deltas to the target.
+
+        Playhead: anchor so the target is 'now' (paused state preserved). Emit: rebase
+        ``_emit_origin`` so the first re-emitted timestamp is just past the last one,
+        keeping timestamps strictly increasing across a backward jump."""
+        snap = self._snapshot_at(target)
+        self._pos_anchor = self._clamp(target)
+        self._wall_anchor = datetime.now(timezone.utc)
+        if snap is not None:
+            snap_time, byte_offset, snap_obs = snap
+            self._reopen_reader_at(byte_offset)
+            emit_base = snap_time
+        else:
+            self._reopen_reader()  # target precedes the first snapshot → from top
+            emit_base = 0.0
+            snap_obs = None
+        if self._last_emit_ts is not None:
+            self._emit_origin = (
+                self._last_emit_ts + timedelta(milliseconds=1)
+                - self._elapsed_offset - timedelta(seconds=emit_base)
+            )
+        if snap_obs:
+            # Emit the snapshot state first so the agent is at the snapshot before the
+            # ≤interval of deltas replay on top of it.
+            self._emit_observations(snap_obs, emit_base)
+        logger.info("Seek to %.1fs (from snapshot at %.0fs)", target, emit_base)
+
     def _loop(self) -> None:
         try:
             self._is_alive = True
             self._is_finished = False
-            start = datetime.now(timezone.utc)
-            # Cumulative dataset duration of all completed passes. Frame offsets
-            # are scheduled and re-stamped relative to (start + elapsed_offset)
-            # so looping playback advances monotonically without resetting time.
-            elapsed_offset = timedelta(0)
+            # Playhead anchored at offset 0 = now; advances at 1x while playing.
+            self._pos_anchor = 0.0
+            self._wall_anchor = datetime.now(timezone.utc)
+            self._paused = False
+            # Emit clock. On the non-seek path _emit_origin == _wall_anchor, so
+            # emitted timestamps match the pre-refactor behavior (loopback test).
+            self._elapsed_offset = timedelta(0)
+            self._emit_origin = self._wall_anchor
+            self._last_emit_ts = None
             first_pass = True
             loop_number = 1
             logger.debug("Thread started")
 
             while not self._stop_event.is_set():
-                # Obtain a reader positioned at the first observation frame. The
-                # first pass reuses the reader opened in open() (probe already
-                # consumed); later passes re-open and discard the probe line.
+                # First pass reuses the reader from open() (probe consumed); later
+                # passes re-open from the top.
                 if first_pass:
                     reader = self._reader
                     first_pass = False
                 else:
-                    reader = MtConnectDatasetReader(self._device_name).open(self._file_path)
-                    reader.read_probe_device_model()  # discard device-model (probe) line
-                    self._reader = reader
+                    reader = self._reopen_reader()
 
                 if self._loop_enabled:
                     logger.info(f"Playback loop {loop_number}")
 
-                pass_frame_start: Optional[datetime] = None
-                pass_last_offset = timedelta(0)
                 prev_frame_timestamp: Optional[datetime] = None
+                any_frames = False
 
                 while not reader.is_finished:
                     if self._stop_event.is_set():
                         logger.debug("Thread stop received")
                         break
 
-                    frame_timestamp, frame_observations = reader.read()
-                    if pass_frame_start is None:
-                        pass_frame_start = frame_timestamp
-                    frame_offset = frame_timestamp - pass_frame_start
+                    # Apply a pending seek before reading the next frame: jump to the
+                    # nearest snapshot, emit its state, then fast-forward to target.
+                    with self._seek_lock:
+                        seek_target = self._seek_target
+                        self._seek_target = None
+                    if seek_target is not None:
+                        self._apply_seek(seek_target)
+                        reader = self._reader
+                        prev_frame_timestamp = None
+                        continue
 
-                    # Guard against an absurd GAP between consecutive frames (which
-                    # would otherwise stall paced playback for that long and usually
-                    # signals corrupt/misordered data) — NOT the dataset's total
-                    # length, which is unbounded.
+                    frame_timestamp, frame_observations = reader.read()
+                    any_frames = True
+                    frame_offset = (frame_timestamp - self._pass_frame_start).total_seconds()
+
+                    # Guard against an absurd GAP between consecutive frames (corrupt/
+                    # misordered data) — NOT the dataset's total length.
                     max_gap_minutes = 10
                     if prev_frame_timestamp is not None:
                         gap = frame_timestamp - prev_frame_timestamp
@@ -510,48 +888,61 @@ class MtConnectDatasetPlayer:
                             )
                     prev_frame_timestamp = frame_timestamp
 
-                    total_delta = elapsed_offset + frame_offset
-
-                    # Wait for frame time
-                    delta = datetime.now(timezone.utc) - start
-                    while total_delta > delta:
+                    # Emit once the playhead target reaches this frame. Behind-target
+                    # frames (a post-seek fast-forward) fall through immediately; a
+                    # caught-up frame paces to real time; a paused (frozen) target
+                    # holds here WITHOUT blocking any earlier catch-up. A seek
+                    # interrupts so it applies at once.
+                    interrupted = False
+                    while frame_offset > self._target_pos():
                         if self._stop_event.is_set():
                             logger.debug("Thread stop received")
                             return
+                        with self._seek_lock:
+                            if self._seek_target is not None:
+                                interrupted = True
+                        if interrupted:
+                            break
                         time.sleep(0.001)
-                        delta = datetime.now(timezone.utc) - start
+                    if interrupted:
+                        # Abandon this frame; the seek re-opens the reader, so it is
+                        # simply re-read after the jump (no data lost).
+                        continue
 
-                    # Re-stamp relative to the play start so each frame's offset
-                    # from the start of playback exactly matches its original
-                    # offset (carried forward across loops by elapsed_offset).
-                    # Using the actual emit time (datetime.now) would drift by the
-                    # scheduling jitter accumulated up to this frame.
-                    if self._re_timestamp:
-                        new_ts = start + total_delta
-                        frame_observations = [
-                            o.model_copy(update={"timestamp": new_ts}) for o in frame_observations
-                        ]
-
-                    self._adapter.enqueue(frame_observations)
+                    self._emit_observations(frame_observations, frame_offset)
                     logger.debug(f"Enqueued {len(frame_observations)} SHDR observations.")
-                    pass_last_offset = frame_offset
 
-                # Pass complete. Stop here unless looping is enabled.
+                # Pass complete (reader exhausted) or stopped.
                 if self._stop_event.is_set() or not self._loop_enabled:
                     break
-
-                # An empty pass (no observation frames) would otherwise spin the
-                # loop; treat it as the end of playback.
-                if pass_frame_start is None:
+                if not any_frames:
                     logger.debug("No observation frames to loop; stopping")
                     break
 
-                # Carry this pass's duration forward so the next pass continues
-                # seamlessly from where this one ended.
-                elapsed_offset += pass_last_offset
-                reader.close()
-                loop_number += 1
-                logger.debug("Looping dataset playback")
+                # Let the playhead run out the remaining span so the pass lasts the
+                # full duration (keeps the scrub bar aligned), unless a seek arrives.
+                tail_seek = False
+                while self._target_pos() < self._duration:
+                    if self._stop_event.is_set():
+                        logger.debug("Thread stop received")
+                        return
+                    with self._seek_lock:
+                        if self._seek_target is not None:
+                            tail_seek = True
+                    if tail_seek:
+                        break
+                    time.sleep(0.02)
+
+                if not tail_seek:
+                    # Wrap: carry a full pass forward for emit-ts monotonicity and
+                    # shift the playhead anchor back one duration so the next pass's
+                    # target restarts near 0.
+                    self._elapsed_offset += timedelta(seconds=self._duration)
+                    self._pos_anchor -= self._duration
+                    loop_number += 1
+                    logger.debug("Looping dataset playback")
+                # else: a seek is pending — loop back, reopen, and let it apply
+                # (no wrap, so the seek's anchor/emit rebase is authoritative).
 
             self._is_finished = True
             logger.debug("Player finished")

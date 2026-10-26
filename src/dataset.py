@@ -41,10 +41,21 @@ class DatasetReader:
 
         self._file: TextIOWrapper = None
         self._next_line: str = None
+        # Byte-offset (an opaque text-stream tell() cookie, captured at a line
+        # boundary) of the frame that read()/peek() will return next. Lets callers
+        # index frame positions and later reopen positioned exactly at a frame line
+        # (no partial-line reassembly, since offsets are always line-start).
+        self._next_offset: Optional[int] = None
 
     @property
     def is_open(self) -> bool:
         return self._file is not None
+
+    @property
+    def next_offset(self) -> Optional[int]:
+        """tell() cookie of the next frame line (the one read()/peek() returns),
+        or None if not open. Pass it to open_at() to resume from this frame."""
+        return self._next_offset
 
     @property
     def is_finished(self) -> bool:
@@ -72,20 +83,44 @@ class DatasetReader:
             self._file.close()
             raise Exception(f"dataset header '{header}' does not match expected header: '{self._header}'")
 
+        self._next_offset = self._file.tell()
+        self._next_line = self._file.readline()
+        return self
+
+    def open_at(self, path: str, offset: int) -> "DatasetReader":
+        """Open ``path`` and position the reader at the frame line starting at
+        ``offset`` (a cookie previously returned by ``next_offset``). The header
+        is still validated. Used to resume playback from an indexed frame without
+        re-reading everything before it."""
+        if not isinstance(path, str):
+            raise TypeError("path must be a str")
+        if self._file is not None:
+            raise Exception("file is already open")
+        if not os.path.isfile(path):
+            raise FileExistsError(f"file '{path}' is not a file.")
+        self._path = path
+        self._file = open(self._path, 'r')
+        header = self._file.readline().rstrip("\n")
+        if header != self._header:
+            self._file.close()
+            raise Exception(f"dataset header '{header}' does not match expected header: '{self._header}'")
+        self._file.seek(offset)
+        self._next_offset = offset
         self._next_line = self._file.readline()
         return self
 
     def close(self) -> None:
         if self._file is None:
             raise Exception("file is not open")
-        
+
         self._file.close()
 
     def read(self) -> DataFrame:
         if self._file is None:
             raise Exception("file is not open")
-        
+
         frame = DataFrame.model_validate_json(self._next_line)
+        self._next_offset = self._file.tell()
         self._next_line = self._file.readline()
         if self._next_line is None or self._next_line == "":
             self.close()

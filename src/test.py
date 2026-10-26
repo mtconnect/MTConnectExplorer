@@ -2,6 +2,7 @@ import math
 import time
 import logging
 import os
+import re
 import signal
 import sys
 import time
@@ -20,19 +21,10 @@ from .agent import Agent, AgentConfig, AgentAdapter
 from .dataset import DataFrame
 
 
-class Config(BaseModel):
-    log_level: Literal["debug", "info", "warning", "error", "critical"] = Field(
-        "info",
-    )
+# Config/logging bootstrap consolidated in src/services/config.py (JSONC parse).
+from .services.config import setup_logging
 
-    def get_log_level_value(self) -> int:
-        return logging._nameToLevel[self.log_level.upper()]
-
-if os.path.isfile("config.json"):
-    l_level = Config.model_validate_json(Path("config.json").read_text()).get_log_level_value()
-else:
-    l_level = Config().get_log_level_value()
-logging.basicConfig(level=l_level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+setup_logging()
 logger = logging.getLogger(__name__)
 
 
