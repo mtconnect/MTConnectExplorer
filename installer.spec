@@ -58,7 +58,7 @@ VSVersionInfo(
 # Include src/ as data (Streamlit runs the page scripts from disk), listed file by file so
 # __pycache__/ and stray *.pyc stay out. Every .pyc records the absolute path of the source
 # it was compiled from, so bundling them embedded the build machine's home path and login in
-# the binary.
+# the binary (see "Privacy and secrets" in AGENTS.md).
 datas = []
 for _dir, _subdirs, _files in os.walk('src'):
     _subdirs[:] = [d for d in _subdirs if d != '__pycache__']

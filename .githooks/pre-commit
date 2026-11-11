@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Scan the staged files for secrets, personal data and transcripts before each commit (AGENTS.md, "Privacy and secrets").
+# Opt in once per clone: git config core.hooksPath .githooks
+exec python3 .github/scripts/check-content.py --staged

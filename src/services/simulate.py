@@ -94,10 +94,10 @@ def simulate_worker(cfg: SimulateWorkerConfig, ctx: WorkerContext) -> None:
     )
     agent: Optional[Agent] = None
     try:
-        # Adapter up first, then the agent (see play_worker: the bundled agent skips the
-        # first-declared adapter if it starts before any adapter is listening). Only one
-        # adapter here, so it's not strictly needed, but keeping the order consistent
-        # future-proofs a multi-adapter simulate.
+        # Adapter up first, then the agent (see play_worker / the AGENTS.md gotcha:
+        # the bundled agent skips the first-declared adapter if it starts before any
+        # adapter is listening). Only one adapter here, so it's not strictly needed,
+        # but keeping the order consistent future-proofs a multi-adapter simulate.
         _log.info("starting adapter...")
         simulator.start()  # binds the SHDR adapter's TCP server
 

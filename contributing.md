@@ -368,13 +368,18 @@ gitGraph
 
     ```bash
     # Branch off main, then move it back to a commit that predates the version bump.
-    # 3470f44 is the current pre-bump baseline — update this SHA next time a new line is cut.
+    # 3a4181e is the repository's root commit, the pre-bump baseline of the 0.1 line;
+    # update this SHA next time a new line is cut.
     git switch -c release/X.Y origin/main
-    git reset --hard 3470f44
+    git reset --hard 3a4181e
     git push -u origin release/X.Y
     ```
 
-    Creating the branch does **not** trigger the release workflow.
+    Only admins can create the branch (*Release Create and Approve*). Pushing it runs the release
+    workflow if the start commit contains it (`release.yml` fires on every push to `release/*`): at a
+    pre-bump commit the version's `X.Y` doesn't match the branch, so the run fails and publishes
+    nothing. Expect that red run. The root commit has no workflows, so cutting
+    `release/0.1` there runs nothing.
 
 1. Open a PR **base: `release/X.Y`**, **compare: `main`** and merge with **Create a merge commit** —
     this fires the pipeline and publishes `vX.Y.Z`.
@@ -445,7 +450,7 @@ All three are enabled because a ruleset can only *narrow* the allowed merge meth
 | Allowed merge methods | [Merge] |
 | Require status checks to pass | true |
 | Require branches to be up to date before merging | false |
-| Do not require status checks on creation | false |
+| Do not require status checks on creation | true |
 | Status checks that are required | [build-windows, build-linux, version-check] |
 | Block force pushes | true |
 
@@ -465,6 +470,12 @@ Rationale:
 - **Restrict Creations = false here**; creation is restricted in the separate *Release Create and
     Approve* ruleset so that restriction can carry an admin bypass without also exempting admins
     from this ruleset's checks and merge-method rules.
+- **Do not require status checks on creation = true.** This ruleset has no bypass list, so with it
+    off nobody, admins included, can push a new `release/X.Y`: the start commit has never had the
+    required checks run on it (`ci.yml` runs on pull requests, not pushes), and GitHub refuses the
+    creation as a rule violation. The admin bypass on *Release Create and Approve* doesn't help,
+    because a bypass exempts an actor only from the ruleset that lists it. Creation stays limited to
+    admins, and every later change still arrives by a PR that must pass the checks.
 
 ### Branch Ruleset: Release Create and Approve
 
@@ -515,7 +526,7 @@ This overlays `release/*` with the rules that should be **admin-bypassable**. Re
 | Allowed merge methods | [Squash] |
 | Require status checks to pass | true |
 | Require branches to be up to date before merging | true |
-| Do not require status checks on creation | false |
+| Do not require status checks on creation | true |
 | Status checks that are required | [build-windows, build-linux, version-check] |
 | Block force pushes | true |
 
@@ -531,8 +542,13 @@ Rationale:
     Adding a creation restriction here (even with an admin bypass) would block the bot and fail the
     release job on its final step. If you ever need creation locked down, give the workflow a
     bypassable identity (a GitHub App token or admin PAT) instead of restricting it for the bot.
-- **`version-check` is not required here** — it's a no-op for non-`release/*` targets, so requiring
-    it would only ever be an always-green check.
+- **Do not require status checks on creation = true**, for the same bot: it creates `dev/X.Y` at
+    the release merge commit, which carries only the release workflow's own runs, not every
+    required check, and its token can't be a bypass actor. Creating a `dev/*` branch skips the
+    checks; every change after that still arrives by a PR that must pass them.
+- **`version-check` is required here too**: on PRs into `main` and `dev/X.Y` it refuses a version that is
+    already released, so a merge can't leave the branch unable to ship. Its `X.Y`-against-branch
+    check runs only on `release/*`.
 
 ### Tag Ruleset: Tags
 
@@ -612,3 +628,10 @@ The release workflow pushes tags and creates the `dev/X.Y` branch. The default `
     setting above.
 - **`dev/X.Y` auto-creation is untested until the first stable release.** When you cut `X.Y.0` (no
     `-` suffix), watch the release job's final step to confirm `dev/X.Y` is actually created.
+- **`dev/X.Y` creation and linear history ❓.** The workflow creates `dev/X.Y` at the release merge
+    commit, a merge commit already on `release/X.Y`. The status-check rule no longer applies to
+    that push (above), and the pull-request rule doesn't block creating a branch (cutting
+    `release/0.1` passed it). GitHub's docs don't say whether *Require linear history* refuses a
+    new branch whose tip is an existing merge commit, so watch that step on the first stable
+    `X.Y.0`. If it is refused, disable *Main and Dev* briefly, push `dev/X.Y` from the release
+    commit, and enable it again.

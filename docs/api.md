@@ -545,7 +545,7 @@ a stated basis; not part of the wire contract.)*
 ## 11. Decision log
 
 Add each entry with its date, the decision, and the rationale, stated in neutral terms; record the
-outcome, not the discussion that led to it.
+outcome, not the discussion that led to it (see "Recording knowledge" in AGENTS.md).
 
 | # | Item | Status |
 |---|---|---|

@@ -141,7 +141,8 @@ def _loopback_generate():
             
             # The bundled agent reads a float sent over SHDR with a trailing ".0" back as an int,
             # so on loopback the value would deserialize as the wrong type (int, not float).
-            # Strip a trailing ".0" before emitting, as _fmt() in simulator.py does.
+            # Strip a trailing ".0" before emitting, as _fmt() in simulator.py does (see the
+            # matching AGENTS.md gotcha).
             s_value = str(value)
             if s_value.endswith(".0"): 
                 s_value = s_value[:-2]

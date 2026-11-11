@@ -10,6 +10,7 @@ venv/
 working/
 
 # Secrets and local state: never commit, never `git add -f`.
+# See "Privacy and secrets" in AGENTS.md.
 config.json
 *.local.json
 .env
