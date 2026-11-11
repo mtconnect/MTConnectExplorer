@@ -1,0 +1,76 @@
+name: Build MTConnectExplorer (Windows)
+description: >
+  The COMPLETE Windows release build — freeze, third-party notices, zip, and the
+  assertions that each one actually produced something. Shared verbatim by the
+  PR gate (ci.yml) and the release workflow (release.yml); only uploading the
+  archive is release-specific.
+
+# See .github/actions/build-linux/action.yml for why this is a composite action
+# rather than two copies of the steps. Same reasoning, same hazard: the gate used
+# to stop after build.bat, so generate_notices.py and Compress-Archive were only
+# ever exercised during an actual release.
+
+outputs:
+  archive:
+    description: Filename of the produced zip, relative to the workspace root.
+    value: ${{ steps.package.outputs.archive }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v7
+      with:
+        python-version: '3.12'
+
+    - name: Build with build.bat
+      shell: cmd
+      run: build.bat ci
+
+    - name: Verify binary was produced
+      shell: pwsh
+      run: |
+        if (-not (Test-Path dist\MTConnectExplorer.exe)) {
+          throw "dist\MTConnectExplorer.exe not found"
+        }
+
+    - name: Generate third-party notices
+      # Runs on EVERY PR, not just releases — see the Linux action's header.
+      shell: cmd
+      run: venv\Scripts\python.exe packaging\generate_notices.py THIRD_PARTY_NOTICES.txt
+
+    - name: Resolve the archive name
+      # Derived from the same single-source version reader the workflows use, so
+      # the gate names the artifact exactly as the release will. Git Bash is on
+      # PATH on windows runners, so the one reader serves both platforms.
+      shell: bash
+      run: |
+        set -euo pipefail
+        version=$(bash .github/scripts/read-version.sh)
+        echo "ARCHIVE=MTConnectExplorer-v${version}-win64.zip" >> "$GITHUB_ENV"
+
+    - name: Package zip
+      id: package
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        Copy-Item THIRD_PARTY_NOTICES.txt dist\
+        Compress-Archive `
+          -Path dist\MTConnectExplorer.exe, dist\THIRD_PARTY_NOTICES.txt `
+          -DestinationPath "$env:ARCHIVE" -Force
+
+        # Assert the archive is real, not merely that the cmdlet returned.
+        if (-not (Test-Path $env:ARCHIVE)) { throw "$env:ARCHIVE was not produced" }
+
+        # Dispose the handle explicitly: OpenRead holds the file open, and a
+        # leaked handle keeps the .zip locked for the rest of the job — the
+        # upload step would then fail on a file "in use by another process".
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $env:ARCHIVE))
+        try   { $entries = @($zip.Entries.Name) }
+        finally { $zip.Dispose() }
+        if ($entries -notcontains 'MTConnectExplorer.exe') {
+          throw "$env:ARCHIVE does not contain MTConnectExplorer.exe"
+        }
+
+        Get-Item $env:ARCHIVE | Format-List Name, Length
+        "archive=$env:ARCHIVE" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8

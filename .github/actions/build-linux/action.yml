@@ -1,0 +1,89 @@
+name: Build MTConnectExplorer (Linux)
+description: >
+  The COMPLETE Linux release build — freeze, third-party notices, tar.gz, and
+  the assertions that each one actually produced something. Shared verbatim by
+  the PR gate (ci.yml) and the release workflow (release.yml); only uploading
+  the archive is release-specific.
+
+# WHY THIS IS A COMPOSITE ACTION AND NOT TWO COPIES OF THE STEPS
+#     The PR gate used to stop after `make` and `test -f dist/MTConnectExplorer`.
+#     Everything after that — generating THIRD_PARTY_NOTICES.txt and rolling the
+#     tar.gz — ran ONLY during a release, which is the most expensive place to
+#     discover a defect: by then the merge into release/X.Y has already happened
+#     and the version is spent, so a fix costs another bump and another merge.
+#
+#     generate_notices.py is the live hazard. It walks installed package
+#     metadata via importlib.metadata, so a new dependency whose metadata is
+#     missing or malformed breaks it — a dependency change the gate happily
+#     passes. The sibling CellSmith repo learned this twice over: its .deb
+#     packaging died on the first REAL payload, and its version guard had never
+#     worked, both in the half its gate skipped.
+#
+#     So the gate now runs the whole build, and there is exactly ONE definition
+#     of what that is. Referenced as `./.github/actions/build-linux`, which
+#     resolves to this repo at the commit under test — the gate and the release
+#     can never run different versions of the build.
+
+outputs:
+  archive:
+    description: Filename of the produced tar.gz, relative to the workspace root.
+    value: ${{ steps.package.outputs.archive }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v7
+      with:
+        python-version: '3.12'
+
+    - name: Build with make
+      shell: bash
+      run: make
+
+    - name: Verify binary was produced
+      shell: bash
+      run: test -f dist/MTConnectExplorer
+
+    - name: Generate third-party notices
+      # Runs on EVERY PR, not just releases — see the header. `make` built the
+      # venv this reads from.
+      shell: bash
+      run: venv/bin/python packaging/generate_notices.py THIRD_PARTY_NOTICES.txt
+
+    - name: Package tar.gz
+      id: package
+      # The archive name is derived from the same single-source version reader
+      # the workflows use, rather than passed in. That way the gate names the
+      # artifact exactly as the release will, so a name that would break the
+      # release breaks the PR instead.
+      shell: bash
+      run: |
+        set -euo pipefail
+        version=$(bash .github/scripts/read-version.sh)
+        archive="MTConnectExplorer-v${version}-linux-x86_64.tar.gz"
+
+        chmod +x dist/MTConnectExplorer
+        cp THIRD_PARTY_NOTICES.txt dist/
+        tar -czvf "$archive" -C dist MTConnectExplorer THIRD_PARTY_NOTICES.txt
+
+        # Assert the archive is real. `tar` exits 0 on an empty input set, so
+        # "the command succeeded" is not the same as "an archive was produced".
+        [ -s "$archive" ] || { echo "::error::$archive was not produced, or is empty"; exit 1; }
+
+        # ⛔ LIST TO A FILE, THEN GREP THE FILE. Never `tar -tzf … | grep -q`.
+        # `grep -q` exits at the first match and closes the pipe while tar is
+        # still streaming through tens of MB of compressed payload to reach the
+        # next entry; tar's next write gets SIGPIPE ("tar: stdout: write
+        # error"), and under `pipefail` that failure becomes the PIPELINE's
+        # status — so the check reports "binary missing" for an archive that
+        # contains it. Note the shape: it fires only when the check SUCCEEDS,
+        # and only once the payload is big enough to keep tar busy, so a small
+        # synthetic fixture passes and the real build fails. This is the same
+        # defect make_deb.sh hit in the sibling CellSmith repo.
+        tar -tzf "$archive" > .archive-contents.txt
+        grep -qx MTConnectExplorer .archive-contents.txt \
+          || { echo "::error::$archive does not contain the MTConnectExplorer binary"; exit 1; }
+        rm -f .archive-contents.txt
+
+        ls -la "$archive"
+        echo "archive=$archive" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,3 @@
+# Store and check out text files with LF line endings on every platform, so an editor or tool that writes CRLF
+# (Windows PowerShell, some IDEs) does not produce whole-file diffs. Git detects binary files and leaves them alone.
+* text=auto eol=lf
